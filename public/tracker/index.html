@@ -192,11 +192,8 @@ const parseStoryCSV = (text) => {
       var ampm = m[7];
       if (ampm === 'PM' && hr !== 12) hr += 12;
       if (ampm === 'AM' && hr === 12) hr = 0;
-      // Later exports in ET, Meta exports in PT (3hr difference). Shift Later back 3hrs to align.
-      var utcDate = new Date(parseInt(yr), parseInt(mo)-1, parseInt(day), hr, parseInt(min));
-      utcDate.setHours(utcDate.getHours() - 3);
-      var date = utcDate.getFullYear() + '-' + String(utcDate.getMonth()+1).padStart(2,'0') + '-' + String(utcDate.getDate()).padStart(2,'0');
-      var time = String(utcDate.getHours()).padStart(2,'0') + ':' + String(utcDate.getMinutes()).padStart(2,'0');
+      var time = String(hr).padStart(2,'0') + ':' + min;
+      var date = yr + '-' + mo + '-' + day;
       var compStr = (r['Completion Rate'] || '0').replace('%','').trim();
       return {
         id: 'st-later-' + i,
@@ -571,40 +568,29 @@ const NITMContentTracker = () => {
           const newStories = parseStoryCSV(text);
           if (newStories.length) {
             setStories(prev => {
+              // Build lookup of existing stories by date+time for merging
+              var existingByDT = {};
+              prev.forEach(function(s) { existingByDT[s.date + '|' + s.time] = s; });
               var added = 0, merged = 0, skipped = 0;
               var result = prev.slice();
-              // Helper: convert date+time to minutes for proximity matching
-              var toMin = function(d, t) { var p = t.split(':'); return (new Date(d+'T00:00:00')).getTime()/60000 + parseInt(p[0])*60 + parseInt(p[1]); };
-
               newStories.forEach(function(ns) {
-                // Find best match: same date, closest time, within 15 min
-                var bestIdx = -1, bestDiff = Infinity;
-                result.forEach(function(s, idx) {
-                  if (s.date !== ns.date) return;
-                  var diff = Math.abs(toMin(s.date, s.time) - toMin(ns.date, ns.time));
-                  if (diff < bestDiff) { bestDiff = diff; bestIdx = idx; }
-                });
-                if (bestIdx >= 0 && bestDiff <= 15) {
-                  // Merge: add imageUrl and Later-specific fields if new has them
-                  var existing = result[bestIdx];
+                var key = ns.date + '|' + ns.time;
+                var existing = existingByDT[key];
+                if (existing) {
+                  // Merge: add imageUrl if the new one has it and existing doesn't
                   if (ns.imageUrl && !existing.imageUrl) {
-                    result[bestIdx] = {...existing, imageUrl: ns.imageUrl, completionRate: ns.completionRate || existing.completionRate || 0, back: ns.back || 0, forward: ns.forward || 0, exited: ns.exited || 0};
-                    merged++;
-                  } else if (!ns.imageUrl && existing.imageUrl) {
-                    // Meta data merging into Later: add link clicks, permalink, etc
-                    if (ns.linkClicks > 0 || ns.permalink) {
-                      result[bestIdx] = {...existing, linkClicks: ns.linkClicks || existing.linkClicks, permalink: ns.permalink || existing.permalink, duration: ns.duration || existing.duration, shares: ns.shares || existing.shares};
-                      merged++;
-                    } else skipped++;
+                    var idx = result.findIndex(function(s){ return s.date === existing.date && s.time === existing.time; });
+                    if (idx !== -1) { result[idx] = {...result[idx], imageUrl: ns.imageUrl, completionRate: ns.completionRate || result[idx].completionRate || 0, back: ns.back || 0, forward: ns.forward || 0, exited: ns.exited || 0}; merged++; }
+                    else skipped++;
                   } else skipped++;
                 } else {
-                  // No close match — add as new
-                  result.push(ns);
-                  added++;
+                  // Check by postId too
+                  if (prev.some(function(s){ return s.postId === ns.postId; })) { skipped++; }
+                  else { result.push(ns); existingByDT[key] = ns; added++; }
                 }
               });
               result.sort(function(a,b) { return (a.date + ' ' + a.time).localeCompare(b.date + ' ' + b.time); });
-              setUploadMsg('\u2705 ' + newStories.length + ' stories parsed \u2014 ' + added + ' new, ' + merged + ' enriched, ' + skipped + ' unchanged');
+              setUploadMsg('\u2705 ' + newStories.length + ' stories parsed \u2014 ' + added + ' new, ' + merged + ' enriched with images, ' + skipped + ' unchanged');
               return result;
             });
           } else setUploadMsg('\u26a0\ufe0f No story data found');
