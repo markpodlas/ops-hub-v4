@@ -457,6 +457,8 @@ async function initCxAgentTables(db) {
       db.prepare("INSERT INTO agent_config (key, value, value_type, description) VALUES (?, ?, ?, ?)").bind('n8n_code_generation_webhook', 'https://nurseinthemaking.app.n8n.cloud/webhook/shopify-order-paid', 'string', 'n8n webhook for code regeneration'),
       db.prepare("INSERT INTO agent_config (key, value, value_type, description) VALUES (?, ?, ?, ?)").bind('anthropic_model', 'claude-opus-4-7', 'string', 'Claude model'),
       db.prepare("INSERT INTO agent_config (key, value, value_type, description) VALUES (?, ?, ?, ?)").bind('support_staff_ids', '[29324864593179,16129176780315,32863955019931,14117981153307]', 'json', 'Zendesk support staff IDs'),
+      db.prepare("INSERT INTO agent_config (key, value, value_type, description) VALUES (?, ?, ?, ?)").bind('max_order_age_days', '90', 'number', 'Max age (days) of orders the agent will auto-respond about'),
+      db.prepare("INSERT INTO agent_config (key, value, value_type, description) VALUES (?, ?, ?, ?)").bind('require_email_match', 'true', 'boolean', 'If true, require Zendesk email matches Shopify order email (unless order number in ticket)'),
     ]);
   }
 
@@ -466,7 +468,7 @@ async function initCxAgentTables(db) {
       db.prepare("INSERT INTO agent_templates (intent, name, body, variables) VALUES (?, ?, ?, ?)").bind(
         'digital_access_success',
         'Ebook code delivery - standard',
-        "Hi {customer_first_name},\n\nThank you so much for reaching out! I am so sorry for the trouble, and I am more than happy to help!\n\nYour code{plural_s} for {product_titles} {is_are}: {codes}\n\nI have attached a PDF containing the directions on how to redeem {this_these} code{plural_s}.\n\nIf you have any more questions, I'll be happy to help.\n\nHappy studying, future nurse!\nKristine :)",
+        "Hi {customer_first_name},\n\nThank you so much for reaching out! I am so sorry for the trouble, and I am more than happy to help!\n\nYour code{plural_s} for {product_titles} {is_are}:\n\n{codes}\n\nI have attached a PDF containing the directions on how to redeem {this_these} code{plural_s}.\n\nIf you have any more questions, I'll be happy to help.\n\nHappy studying, future nurse!\nKristine :)",
         '["customer_first_name","product_titles","codes","plural_s","is_are","this_these"]'
       ),
       db.prepare("INSERT INTO agent_templates (intent, name, body, variables) VALUES (?, ?, ?, ?)").bind(
@@ -613,9 +615,100 @@ Respond in this exact JSON format:
 }
 
 async function cxHandleDigitalAccess(ticketId, ticketData, intent, db, env, tracer) {
-  const order = await tracer.trace('shopify_order_lookup', async () => cxFindCustomerOrder(ticketData, db, env));
-  if (!order) { await cxEscalate(ticketId, ticketData, intent, 'Could not find order for customer.', db, env, tracer); return; }
+  // STEP: Detect order number in ticket (if any)
+  const orderNumberMatch = (ticketData.subject || '').match(/#?(\d{1,2}-\d{4,7})/) || (ticketData.firstMessage || '').match(/#?(\d{1,2}-\d{4,7})/);
+  const explicitOrderNumber = orderNumberMatch ? orderNumberMatch[1] : null;
 
+  // STEP: Look up customer orders (may return multiple)
+  const orderLookup = await tracer.trace('shopify_order_lookup', async () => {
+    return await cxFindCustomerOrders(ticketData, explicitOrderNumber, db, env);
+  });
+
+  if (!orderLookup.order && !orderLookup.candidates?.length) {
+    await cxEscalate(ticketId, ticketData, intent, 'Could not find any orders for this customer.', db, env, tracer, {
+      customer_email: ticketData.customerEmail,
+      explicit_order_number: explicitOrderNumber || 'none'
+    });
+    return;
+  }
+
+  // STEP: Multi-order disambiguation
+  if (!orderLookup.order && orderLookup.candidates?.length > 1) {
+    const summary = orderLookup.candidates.slice(0, 5).map(o =>
+      `    ${o.name} (${new Date(o.created_at).toLocaleDateString()}) - ${o.line_items.filter(li => li.sku?.startsWith('D-')).map(li => li.sku).join(', ')}`
+    ).join('\n');
+    await cxEscalate(ticketId, ticketData, intent,
+      `Customer has ${orderLookup.candidates.length} ebook orders in last 90 days. Needs human to identify which one they are asking about.`,
+      db, env, tracer, {
+        customer_email: ticketData.customerEmail,
+        explicit_order_number: explicitOrderNumber || 'none',
+        candidate_orders: '\n' + summary
+      });
+    return;
+  }
+
+  const order = orderLookup.order;
+
+  // STEP: Safeguard checks
+  const safeguardIssues = await tracer.trace('safeguard_checks', async () => {
+    const issues = [];
+
+    // Cancelled order
+    if (order.cancelled_at) {
+      issues.push(`Order was cancelled on ${new Date(order.cancelled_at).toLocaleDateString()}`);
+    }
+
+    // Refunded / voided
+    if (order.financial_status === 'refunded' || order.financial_status === 'voided' || order.financial_status === 'partially_refunded') {
+      issues.push(`Order financial status is '${order.financial_status}'`);
+    }
+
+    // Age check
+    const maxAgeDays = await cxGetConfig(db, 'max_order_age_days');
+    const orderAgeDays = Math.floor((Date.now() - new Date(order.created_at).getTime()) / (1000 * 60 * 60 * 24));
+    if (orderAgeDays > maxAgeDays) {
+      issues.push(`Order is ${orderAgeDays} days old (policy: max ${maxAgeDays} days)`);
+    }
+
+    // Email match (unless explicit order number was provided in ticket)
+    const requireEmailMatch = await cxGetConfig(db, 'require_email_match');
+    if (requireEmailMatch && !explicitOrderNumber) {
+      const ticketEmail = (ticketData.customerEmail || '').toLowerCase().trim();
+      const orderEmail = (order.email || '').toLowerCase().trim();
+      if (ticketEmail && orderEmail && ticketEmail !== orderEmail) {
+        issues.push(`Email mismatch: ticket from '${ticketEmail}' vs order billed to '${orderEmail}'. No order number in ticket to confirm which order.`);
+      }
+    }
+
+    return {
+      passed: issues.length === 0,
+      issues,
+      order_id: order.id,
+      order_number: order.name,
+      order_email: order.email,
+      order_created_at: order.created_at,
+      order_age_days: orderAgeDays,
+      order_cancelled: !!order.cancelled_at,
+      order_financial_status: order.financial_status,
+      email_match_required: requireEmailMatch,
+      explicit_order_number: explicitOrderNumber || null
+    };
+  });
+
+  if (!safeguardIssues.passed) {
+    await cxEscalate(ticketId, ticketData, intent,
+      `Safeguard check failed: ${safeguardIssues.issues.join('; ')}`,
+      db, env, tracer, {
+        order_id: order.id,
+        order_number: order.name,
+        order_email: order.email,
+        order_created: order.created_at,
+        issues: safeguardIssues.issues.join(' | ')
+      });
+    return;
+  }
+
+  // STEP: Read fulfillment metafields
   const metafields = await tracer.trace('shopify_metafields_lookup', async () => cxFetchOrderMetafields(order.id, db, env));
   const vsStatus = metafields.find(m => m.namespace === 'vitalsource' && m.key === 'status')?.value;
   const vsCode = metafields.find(m => m.namespace === 'vitalsource' && m.key === 'code')?.value;
@@ -647,19 +740,51 @@ async function cxHandleDigitalAccess(ticketId, ticketData, intent, db, env, trac
 
 async function cxDeliverExistingCode(ticketId, ticketData, order, vsCode, db, env, tracer) {
   const response = await tracer.trace('draft_response', async () => {
-    const codeEntries = vsCode.split(',').map(s => s.trim());
+    // Parse codes — format from the metafield is "CODE - Product Title, CODE2 - Product Title 2"
+    const codeEntries = vsCode.split(',').map(s => s.trim()).filter(Boolean);
+    const parsedCodes = codeEntries.map(entry => {
+      const dashIndex = entry.indexOf(' - ');
+      if (dashIndex > 0) {
+        return { code: entry.substring(0, dashIndex).trim(), title: entry.substring(dashIndex + 3).trim() };
+      }
+      return { code: entry, title: null };
+    });
+
     const customerFirstName = order.customer?.first_name || cxFirstNameFromEmail(ticketData.customerEmail);
     const template = await cxGetTemplate(db, 'digital_access_success');
-    const plural = codeEntries.length > 1;
+    const plural = parsedCodes.length > 1;
+
+    // Format: product titles list (e.g. "Mother Baby Study Guide and Fundamentals Study Guide")
+    const productTitles = parsedCodes
+      .map(p => p.title || 'your ebook')
+      .filter((v, i, a) => a.indexOf(v) === i) // dedupe
+      .join(' and ');
+
+    // Format: codes listed with their product (one per line for multi-code orders)
+    const codesFormatted = parsedCodes.length > 1
+      ? parsedCodes.map(p => `  ${p.code}${p.title ? ` (${p.title})` : ''}`).join('\n')
+      : parsedCodes[0].code;
+
     const body = template.body
       .replace('{customer_first_name}', customerFirstName)
-      .replace('{product_titles}', codeEntries.map(e => e.split(' - ')[1] || 'your ebook').join(' and '))
+      .replace('{product_titles}', productTitles)
       .replaceAll('{plural_s}', plural ? 's' : '')
       .replace('{is_are}', plural ? 'are' : 'is')
-      .replace('{codes}', codeEntries.join(' | '))
+      .replace('{codes}', codesFormatted)
       .replaceAll('{this_these}', plural ? 'these' : 'this');
-    return { body, confidence: 0.95, reasoning: `Found ${codeEntries.length} valid code(s) on order ${order.name}.`,
-      data_sources: { order_id: order.id, order_number: order.name, code_count: codeEntries.length, customer_name: customerFirstName } };
+
+    return {
+      body,
+      confidence: 0.95,
+      reasoning: `Found ${parsedCodes.length} valid code(s) on order ${order.name}.`,
+      data_sources: {
+        order_id: order.id,
+        order_number: order.name,
+        code_count: parsedCodes.length,
+        customer_name: customerFirstName,
+        codes_summary: parsedCodes.map(p => p.code.substring(0, 6) + '...').join(', ')
+      }
+    };
   });
   const responseId = await cxSaveResponse(db, ticketId, response);
   await tracer.trace('post_internal_note', async () => cxPostInternalNote(ticketData.zendeskTicketId, response.body, db, env));
@@ -741,6 +866,61 @@ async function cxPostInternalNote(ticketId, body, db, env) {
   return { status: resp.status, ok: resp.ok };
 }
 
+async function cxFindCustomerOrders(ticketData, explicitOrderNumber, db, env) {
+  const shopDomain = await cxGetConfig(db, 'shopify_store_domain');
+  const maxAgeDays = await cxGetConfig(db, 'max_order_age_days');
+
+  // Path A: Explicit order number in ticket — use that as ground truth
+  if (explicitOrderNumber) {
+    const resp = await fetch(`https://${shopDomain}/admin/api/2024-01/orders.json?name=${encodeURIComponent('#' + explicitOrderNumber)}&status=any`, {
+      headers: { 'X-Shopify-Access-Token': env.SHOPIFY_ACCESS_TOKEN }
+    });
+    if (resp.ok) {
+      const { orders } = await resp.json();
+      if (orders && orders.length > 0) {
+        return { order: orders[0], candidates: orders, found_by: 'order_number' };
+      }
+    }
+    // Order number provided but not found — return no order so escalation triggers
+    return { order: null, candidates: [], found_by: 'order_number_not_found' };
+  }
+
+  // Path B: No order number, look up by customer email
+  if (!ticketData.customerEmail) {
+    return { order: null, candidates: [], found_by: 'no_email_no_order_number' };
+  }
+
+  const resp = await fetch(
+    `https://${shopDomain}/admin/api/2024-01/orders.json?email=${encodeURIComponent(ticketData.customerEmail)}&status=any&limit=20`,
+    { headers: { 'X-Shopify-Access-Token': env.SHOPIFY_ACCESS_TOKEN } }
+  );
+  if (!resp.ok) return { order: null, candidates: [], found_by: 'api_error' };
+
+  const { orders = [] } = await resp.json();
+
+  // Filter to recent ebook orders only
+  const cutoffDate = Date.now() - (maxAgeDays * 24 * 60 * 60 * 1000);
+  const ebookOrders = orders.filter(o => {
+    const hasEbook = o.line_items?.some(li => li.sku?.startsWith('D-'));
+    const recent = new Date(o.created_at).getTime() >= cutoffDate;
+    return hasEbook && recent;
+  });
+
+  if (ebookOrders.length === 0) {
+    // Maybe customer has older orders — return them as candidates for context, but no auto-match
+    const olderEbookOrders = orders.filter(o => o.line_items?.some(li => li.sku?.startsWith('D-')));
+    return { order: null, candidates: olderEbookOrders, found_by: 'no_recent_ebook_orders' };
+  }
+
+  if (ebookOrders.length === 1) {
+    return { order: ebookOrders[0], candidates: ebookOrders, found_by: 'single_recent_ebook_order' };
+  }
+
+  // Multiple candidates — don't auto-pick, let handler escalate
+  return { order: null, candidates: ebookOrders, found_by: 'multiple_candidates' };
+}
+
+// Legacy single-order function kept for backward compatibility (not used anymore)
 async function cxFindCustomerOrder(ticketData, db, env) {
   const shopDomain = await cxGetConfig(db, 'shopify_store_domain');
   const orderMatch = (ticketData.subject || '').match(/#?(\d{1,2}-\d{4,7})/) || (ticketData.firstMessage || '').match(/#?(\d{1,2}-\d{4,7})/);
