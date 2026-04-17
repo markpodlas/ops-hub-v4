@@ -14,7 +14,7 @@
     {
       "binding": "CX_AGENT_DB",
       "database_name": "cx-agent",
-      "database_id": "PUT_CX_AGENT_DATABASE_ID_HERE"
+      "database_id": "47d05b88-dfae-4755-a52e-3115ab6d09ff"
     }
   ],
   "triggers": {
