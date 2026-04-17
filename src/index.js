@@ -615,157 +615,206 @@ Respond in this exact JSON format:
 }
 
 async function cxHandleDigitalAccess(ticketId, ticketData, intent, db, env, tracer) {
-  // STEP: Detect order number in ticket (if any)
-  const orderNumberMatch = (ticketData.subject || '').match(/#?(\d{1,2}-\d{4,7})/) || (ticketData.firstMessage || '').match(/#?(\d{1,2}-\d{4,7})/);
-  const explicitOrderNumber = orderNumberMatch ? orderNumberMatch[1] : null;
+  // STEP: Detect ALL order numbers in ticket (dedupe, keep order)
+  const fullText = `${ticketData.subject || ''}\n${ticketData.firstMessage || ''}`;
+  const orderNumbersFound = Array.from(new Set(
+    (fullText.match(/#?(\d{1,2}-\d{4,7})/g) || []).map(m => m.replace(/^#/, ''))
+  ));
 
-  // STEP: Look up customer orders (may return multiple)
+  // STEP: Look up orders — by explicit numbers if found, otherwise by customer email
   const orderLookup = await tracer.trace('shopify_order_lookup', async () => {
-    return await cxFindCustomerOrders(ticketData, explicitOrderNumber, db, env);
+    return await cxFindCustomerOrders(ticketData, orderNumbersFound, db, env);
   });
 
-  if (!orderLookup.order && !orderLookup.candidates?.length) {
+  // Case: no orders found at all
+  if (!orderLookup.order && !orderLookup.orders?.length && !orderLookup.candidates?.length) {
     await cxEscalate(ticketId, ticketData, intent, 'Could not find any orders for this customer.', db, env, tracer, {
       customer_email: ticketData.customerEmail,
-      explicit_order_number: explicitOrderNumber || 'none'
+      order_numbers_in_ticket: orderNumbersFound.length > 0 ? orderNumbersFound.join(', ') : 'none'
     });
     return;
   }
 
-  // STEP: Multi-order disambiguation
-  if (!orderLookup.order && orderLookup.candidates?.length > 1) {
+  // Case: multiple candidates, no explicit order numbers — can't safely pick one
+  if (!orderLookup.orders?.length && orderLookup.candidates?.length > 1) {
     const summary = orderLookup.candidates.slice(0, 5).map(o =>
       `    ${o.name} (${new Date(o.created_at).toLocaleDateString()}) - ${o.line_items.filter(li => li.sku?.startsWith('D-')).map(li => li.sku).join(', ')}`
     ).join('\n');
     await cxEscalate(ticketId, ticketData, intent,
-      `Customer has ${orderLookup.candidates.length} ebook orders in last 90 days. Needs human to identify which one they are asking about.`,
+      `Customer has ${orderLookup.candidates.length} ebook orders in last 90 days but didn't specify which one. Needs human review.`,
       db, env, tracer, {
         customer_email: ticketData.customerEmail,
-        explicit_order_number: explicitOrderNumber || 'none',
         candidate_orders: '\n' + summary
       });
     return;
   }
 
-  const order = orderLookup.order;
+  // At this point we have one or more orders to process
+  const ordersToProcess = orderLookup.orders || (orderLookup.order ? [orderLookup.order] : []);
 
-  // STEP: Safeguard checks
-  const safeguardIssues = await tracer.trace('safeguard_checks', async () => {
-    const issues = [];
-
-    // Cancelled order
-    if (order.cancelled_at) {
-      issues.push(`Order was cancelled on ${new Date(order.cancelled_at).toLocaleDateString()}`);
-    }
-
-    // Refunded / voided
-    if (order.financial_status === 'refunded' || order.financial_status === 'voided' || order.financial_status === 'partially_refunded') {
-      issues.push(`Order financial status is '${order.financial_status}'`);
-    }
-
-    // Age check
+  // STEP: Run safeguards on every order; split into valid/invalid
+  const validated = await tracer.trace('safeguard_checks', async () => {
+    const valid = [];
+    const invalid = [];
     const maxAgeDays = await cxGetConfig(db, 'max_order_age_days');
-    const orderAgeDays = Math.floor((Date.now() - new Date(order.created_at).getTime()) / (1000 * 60 * 60 * 24));
-    if (orderAgeDays > maxAgeDays) {
-      issues.push(`Order is ${orderAgeDays} days old (policy: max ${maxAgeDays} days)`);
-    }
-
-    // Email match (unless explicit order number was provided in ticket)
     const requireEmailMatch = await cxGetConfig(db, 'require_email_match');
-    if (requireEmailMatch && !explicitOrderNumber) {
-      const ticketEmail = (ticketData.customerEmail || '').toLowerCase().trim();
-      const orderEmail = (order.email || '').toLowerCase().trim();
-      if (ticketEmail && orderEmail && ticketEmail !== orderEmail) {
-        issues.push(`Email mismatch: ticket from '${ticketEmail}' vs order billed to '${orderEmail}'. No order number in ticket to confirm which order.`);
+    const ticketEmail = (ticketData.customerEmail || '').toLowerCase().trim();
+
+    for (const order of ordersToProcess) {
+      const issues = [];
+      if (order.cancelled_at) issues.push(`Order was cancelled on ${new Date(order.cancelled_at).toLocaleDateString()}`);
+      if (['refunded', 'voided', 'partially_refunded'].includes(order.financial_status)) {
+        issues.push(`Order financial status is '${order.financial_status}'`);
+      }
+      const ageDays = Math.floor((Date.now() - new Date(order.created_at).getTime()) / (86400000));
+      if (ageDays > maxAgeDays) issues.push(`Order is ${ageDays} days old (policy: max ${maxAgeDays} days)`);
+      if (requireEmailMatch && !orderNumbersFound.length) {
+        const orderEmail = (order.email || '').toLowerCase().trim();
+        if (ticketEmail && orderEmail && ticketEmail !== orderEmail) {
+          issues.push(`Email mismatch: ticket '${ticketEmail}' vs order '${orderEmail}'`);
+        }
+      }
+      if (issues.length > 0) {
+        invalid.push({ order, issues, name: order.name });
+      } else {
+        valid.push(order);
       }
     }
 
     return {
-      passed: issues.length === 0,
-      issues,
-      order_id: order.id,
-      order_number: order.name,
-      order_email: order.email,
-      order_created_at: order.created_at,
-      order_age_days: orderAgeDays,
-      order_cancelled: !!order.cancelled_at,
-      order_financial_status: order.financial_status,
-      email_match_required: requireEmailMatch,
-      explicit_order_number: explicitOrderNumber || null
+      total: ordersToProcess.length,
+      valid_count: valid.length,
+      invalid_count: invalid.length,
+      valid_orders: valid.map(o => o.name),
+      invalid_orders: invalid.map(i => ({ name: i.name, issues: i.issues }))
     };
   });
 
-  if (!safeguardIssues.passed) {
+  // Case: all orders failed safeguards
+  if (validated.valid_count === 0) {
+    const summary = validated.invalid_orders.map(i => `  ${i.name}: ${i.issues.join('; ')}`).join('\n');
     await cxEscalate(ticketId, ticketData, intent,
-      `Safeguard check failed: ${safeguardIssues.issues.join('; ')}`,
-      db, env, tracer, {
-        order_id: order.id,
-        order_number: order.name,
-        order_email: order.email,
-        order_created: order.created_at,
-        issues: safeguardIssues.issues.join(' | ')
-      });
+      `All referenced orders failed safeguard checks.`,
+      db, env, tracer, { invalid_orders: '\n' + summary });
     return;
   }
 
-  // STEP: Read fulfillment metafields
-  const metafields = await tracer.trace('shopify_metafields_lookup', async () => cxFetchOrderMetafields(order.id, db, env));
-  const vsStatus = metafields.find(m => m.namespace === 'vitalsource' && m.key === 'status')?.value;
-  const vsCode = metafields.find(m => m.namespace === 'vitalsource' && m.key === 'code')?.value;
-  const vsExpected = metafields.find(m => m.namespace === 'vitalsource' && m.key === 'expected_count')?.value;
+  // Get the valid orders to process
+  const validOrders = ordersToProcess.filter(o => validated.valid_orders.includes(o.name));
 
-  const decision = await tracer.trace('fulfillment_decision', async () => {
-    if (vsStatus === 'complete' && vsCode) return { action: 'deliver_existing_code', reasoning: 'Codes generated successfully, need to resend' };
-    if (vsStatus === 'partial') return { action: 'escalate_partial', reasoning: `Only ${vsCode?.split(',').length || 0}/${vsExpected} codes generated. Human should regenerate missing ones.` };
-    if (vsStatus === 'failed') return { action: 'trigger_regeneration', reasoning: 'All code generation failed. Triggering regeneration via n8n.' };
-    if (!vsStatus) {
-      const orderHasEbook = order.line_items?.some(li => li.sku?.startsWith('D-'));
-      if (orderHasEbook) return { action: 'trigger_regeneration', reasoning: 'Legacy order, no fulfillment status metafield. Triggering regeneration.' };
-      return { action: 'escalate_no_ebook', reasoning: 'Order contains no ebook products.' };
+  // STEP: Look up fulfillment metafields for each valid order
+  const orderFulfillments = await tracer.trace('shopify_metafields_lookup_multi', async () => {
+    const results = [];
+    for (const order of validOrders) {
+      const metafields = await cxFetchOrderMetafields(order.id, db, env);
+      const vsStatus = metafields.find(m => m.namespace === 'vitalsource' && m.key === 'status')?.value;
+      const vsCode = metafields.find(m => m.namespace === 'vitalsource' && m.key === 'code')?.value;
+      const vsExpected = metafields.find(m => m.namespace === 'vitalsource' && m.key === 'expected_count')?.value;
+      results.push({ order, vsStatus, vsCode, vsExpected });
     }
-    return { action: 'escalate_unknown_state', reasoning: `Unknown fulfillment status: ${vsStatus}` };
+    return { count: results.length, summary: results.map(r => ({ order: r.order.name, status: r.vsStatus, has_code: !!r.vsCode })) };
   });
 
-  if (decision.action === 'deliver_existing_code') {
-    await cxDeliverExistingCode(ticketId, ticketData, order, vsCode, db, env, tracer);
-  } else if (decision.action === 'trigger_regeneration') {
-    await cxTriggerRegeneration(ticketId, ticketData, order, db, env, tracer);
-  } else {
-    await cxEscalate(ticketId, ticketData, intent, decision.reasoning, db, env, tracer, {
-      order_id: order.id, order_number: order.name,
-      vs_status: vsStatus, vs_code: vsCode, vs_expected: vsExpected
-    });
+  // Recompute fulfillment results (they're not stored in the tracer summary, need to fetch again to use)
+  const fulfillments = [];
+  for (const order of validOrders) {
+    const metafields = await cxFetchOrderMetafields(order.id, db, env);
+    const vsStatus = metafields.find(m => m.namespace === 'vitalsource' && m.key === 'status')?.value;
+    const vsCode = metafields.find(m => m.namespace === 'vitalsource' && m.key === 'code')?.value;
+    const vsExpected = metafields.find(m => m.namespace === 'vitalsource' && m.key === 'expected_count')?.value;
+    fulfillments.push({ order, vsStatus, vsCode, vsExpected });
   }
+
+  // STEP: Decide per-order what to do
+  const decisions = await tracer.trace('fulfillment_decision_multi', async () => {
+    return fulfillments.map(f => {
+      if (f.vsStatus === 'complete' && f.vsCode) return { order_name: f.order.name, action: 'deliver', vsCode: f.vsCode };
+      if (f.vsStatus === 'partial') return { order_name: f.order.name, action: 'escalate', reason: `Partial: ${f.vsCode?.split(',').length || 0}/${f.vsExpected} codes generated` };
+      if (f.vsStatus === 'failed') return { order_name: f.order.name, action: 'regenerate', reason: 'Generation failed' };
+      if (!f.vsStatus) {
+        const orderHasEbook = f.order.line_items?.some(li => li.sku?.startsWith('D-'));
+        if (orderHasEbook) return { order_name: f.order.name, action: 'regenerate', reason: 'Legacy order, no status metafield' };
+        return { order_name: f.order.name, action: 'skip', reason: 'No ebook products' };
+      }
+      return { order_name: f.order.name, action: 'escalate', reason: `Unknown status: ${f.vsStatus}` };
+    });
+  });
+
+  const deliverable = decisions.filter(d => d.action === 'deliver');
+  const needRegen = decisions.filter(d => d.action === 'regenerate');
+  const needEscalate = decisions.filter(d => d.action === 'escalate' || d.action === 'skip');
+
+  // Simple case: everything is deliverable
+  if (deliverable.length === ordersToProcess.length && deliverable.length > 0) {
+    await cxDeliverExistingCodesMulti(ticketId, ticketData, fulfillments, db, env, tracer, validated.invalid_orders);
+    return;
+  }
+
+  // Simple case: everything needs regeneration
+  if (needRegen.length === ordersToProcess.length && deliverable.length === 0) {
+    // Just trigger regen on the first one (typical case: one legacy order)
+    const firstOrder = fulfillments.find(f => f.order.name === needRegen[0].order_name).order;
+    await cxTriggerRegeneration(ticketId, ticketData, firstOrder, db, env, tracer);
+    return;
+  }
+
+  // Mixed case: some deliverable, some not — deliver what we can and escalate the rest
+  if (deliverable.length > 0) {
+    const deliverableFulfillments = fulfillments.filter(f => deliverable.some(d => d.order_name === f.order.name));
+    await cxDeliverExistingCodesMulti(
+      ticketId, ticketData, deliverableFulfillments, db, env, tracer,
+      validated.invalid_orders.concat(
+        needEscalate.map(e => ({ name: e.order_name, issues: [e.reason] })),
+        needRegen.map(r => ({ name: r.order_name, issues: [r.reason + ' — may need regeneration'] }))
+      )
+    );
+    return;
+  }
+
+  // Fallback: nothing deliverable, escalate everything
+  const allIssues = decisions.map(d => `  ${d.order_name}: ${d.reason || d.action}`).join('\n');
+  await cxEscalate(ticketId, ticketData, intent, `No orders with deliverable codes.`, db, env, tracer, { order_issues: '\n' + allIssues });
 }
 
 async function cxDeliverExistingCode(ticketId, ticketData, order, vsCode, db, env, tracer) {
+  // Wrap single-order into multi-order flow for consistency
+  await cxDeliverExistingCodesMulti(ticketId, ticketData, [{ order, vsCode }], db, env, tracer, []);
+}
+
+async function cxDeliverExistingCodesMulti(ticketId, ticketData, fulfillments, db, env, tracer, invalidNotes = []) {
   const response = await tracer.trace('draft_response', async () => {
-    // Parse codes — format from the metafield is "CODE - Product Title, CODE2 - Product Title 2"
-    const codeEntries = vsCode.split(',').map(s => s.trim()).filter(Boolean);
-    const parsedCodes = codeEntries.map(entry => {
-      const dashIndex = entry.indexOf(' - ');
-      if (dashIndex > 0) {
-        return { code: entry.substring(0, dashIndex).trim(), title: entry.substring(dashIndex + 3).trim() };
+    // Collect all codes across all orders
+    const allParsedCodes = [];
+    for (const f of fulfillments) {
+      const codeEntries = f.vsCode.split(',').map(s => s.trim()).filter(Boolean);
+      for (const entry of codeEntries) {
+        const dashIndex = entry.indexOf(' - ');
+        if (dashIndex > 0) {
+          allParsedCodes.push({
+            code: entry.substring(0, dashIndex).trim(),
+            title: entry.substring(dashIndex + 3).trim(),
+            order_name: f.order.name
+          });
+        } else {
+          allParsedCodes.push({ code: entry, title: null, order_name: f.order.name });
+        }
       }
-      return { code: entry, title: null };
-    });
+    }
 
-    const customerFirstName = order.customer?.first_name || cxFirstNameFromEmail(ticketData.customerEmail);
+    const firstOrder = fulfillments[0].order;
+    const customerFirstName = firstOrder.customer?.first_name || cxFirstNameFromEmail(ticketData.customerEmail);
     const template = await cxGetTemplate(db, 'digital_access_success');
-    const plural = parsedCodes.length > 1;
+    const plural = allParsedCodes.length > 1;
 
-    // Format: product titles list (e.g. "Mother Baby Study Guide and Fundamentals Study Guide")
-    const productTitles = parsedCodes
-      .map(p => p.title || 'your ebook')
-      .filter((v, i, a) => a.indexOf(v) === i) // dedupe
-      .join(' and ');
+    // Product titles list (dedupe)
+    const productTitles = Array.from(new Set(allParsedCodes.map(p => p.title || 'your ebook'))).join(' and ');
 
-    // Format: codes listed with their product (one per line for multi-code orders)
-    const codesFormatted = parsedCodes.length > 1
-      ? parsedCodes.map(p => `  ${p.code}${p.title ? ` (${p.title})` : ''}`).join('\n')
-      : parsedCodes[0].code;
+    // Codes list
+    const codesFormatted = allParsedCodes.length > 1
+      ? allParsedCodes.map(p => `  ${p.code}${p.title ? ` (${p.title})` : ''}`).join('\n')
+      : allParsedCodes[0].code;
 
-    const body = template.body
+    let body = template.body
       .replace('{customer_first_name}', customerFirstName)
       .replace('{product_titles}', productTitles)
       .replaceAll('{plural_s}', plural ? 's' : '')
@@ -773,19 +822,27 @@ async function cxDeliverExistingCode(ticketId, ticketData, order, vsCode, db, en
       .replace('{codes}', codesFormatted)
       .replaceAll('{this_these}', plural ? 'these' : 'this');
 
+    // If there were problematic orders mixed in, add a human-visible note to the response
+    // (this is internal_note content, so it's ok to have meta info for the human)
+    if (invalidNotes && invalidNotes.length > 0) {
+      const notes = invalidNotes.map(i => `  ${i.name}: ${Array.isArray(i.issues) ? i.issues.join('; ') : i.issues}`).join('\n');
+      body += `\n\n---\n[AGENT NOTE TO HUMAN REVIEWER]\nCustomer may have mentioned these other orders that were NOT included in the response above:\n${notes}\nReview whether these need human follow-up.`;
+    }
+
     return {
       body,
       confidence: 0.95,
-      reasoning: `Found ${parsedCodes.length} valid code(s) on order ${order.name}.`,
+      reasoning: `Delivering ${allParsedCodes.length} code(s) across ${fulfillments.length} order(s): ${fulfillments.map(f => f.order.name).join(', ')}${invalidNotes.length ? ` [+${invalidNotes.length} flagged for human]` : ''}`,
       data_sources: {
-        order_id: order.id,
-        order_number: order.name,
-        code_count: parsedCodes.length,
+        order_count: fulfillments.length,
+        order_numbers: fulfillments.map(f => f.order.name),
+        code_count: allParsedCodes.length,
         customer_name: customerFirstName,
-        codes_summary: parsedCodes.map(p => p.code.substring(0, 6) + '...').join(', ')
+        flagged_orders: invalidNotes.length
       }
     };
   });
+
   const responseId = await cxSaveResponse(db, ticketId, response);
   await tracer.trace('post_internal_note', async () => cxPostInternalNote(ticketData.zendeskTicketId, response.body, db, env));
   await db.prepare(`UPDATE agent_responses SET status = 'posted_as_note', posted_to_zendesk_at = datetime('now') WHERE id = ?`).bind(responseId).run();
@@ -866,39 +923,48 @@ async function cxPostInternalNote(ticketId, body, db, env) {
   return { status: resp.status, ok: resp.ok };
 }
 
-async function cxFindCustomerOrders(ticketData, explicitOrderNumber, db, env) {
+async function cxFindCustomerOrders(ticketData, orderNumbersFound, db, env) {
   const shopDomain = await cxGetConfig(db, 'shopify_store_domain');
   const maxAgeDays = await cxGetConfig(db, 'max_order_age_days');
+  const authHeaders = { 'X-Shopify-Access-Token': env.SHOPIFY_ACCESS_TOKEN };
 
-  // Path A: Explicit order number in ticket — use that as ground truth
-  if (explicitOrderNumber) {
-    const resp = await fetch(`https://${shopDomain}/admin/api/2024-01/orders.json?name=${encodeURIComponent('#' + explicitOrderNumber)}&status=any`, {
-      headers: { 'X-Shopify-Access-Token': env.SHOPIFY_ACCESS_TOKEN }
-    });
-    if (resp.ok) {
-      const { orders } = await resp.json();
-      if (orders && orders.length > 0) {
-        return { order: orders[0], candidates: orders, found_by: 'order_number' };
+  // Path A: Explicit order numbers in ticket — look up each one
+  if (orderNumbersFound && orderNumbersFound.length > 0) {
+    const foundOrders = [];
+    const notFound = [];
+    for (const num of orderNumbersFound) {
+      const resp = await fetch(`https://${shopDomain}/admin/api/2024-01/orders.json?name=${encodeURIComponent('#' + num)}&status=any`, { headers: authHeaders });
+      if (resp.ok) {
+        const { orders } = await resp.json();
+        if (orders && orders.length > 0) {
+          foundOrders.push(orders[0]);
+        } else {
+          notFound.push(num);
+        }
+      } else {
+        notFound.push(num);
       }
     }
-    // Order number provided but not found — return no order so escalation triggers
-    return { order: null, candidates: [], found_by: 'order_number_not_found' };
+    return {
+      orders: foundOrders,
+      candidates: foundOrders,
+      order_numbers_not_found: notFound,
+      found_by: 'order_numbers'
+    };
   }
 
-  // Path B: No order number, look up by customer email
+  // Path B: No order numbers, look up by customer email
   if (!ticketData.customerEmail) {
-    return { order: null, candidates: [], found_by: 'no_email_no_order_number' };
+    return { orders: [], candidates: [], found_by: 'no_email_no_order_number' };
   }
 
   const resp = await fetch(
     `https://${shopDomain}/admin/api/2024-01/orders.json?email=${encodeURIComponent(ticketData.customerEmail)}&status=any&limit=20`,
-    { headers: { 'X-Shopify-Access-Token': env.SHOPIFY_ACCESS_TOKEN } }
+    { headers: authHeaders }
   );
-  if (!resp.ok) return { order: null, candidates: [], found_by: 'api_error' };
+  if (!resp.ok) return { orders: [], candidates: [], found_by: 'api_error' };
 
   const { orders = [] } = await resp.json();
-
-  // Filter to recent ebook orders only
   const cutoffDate = Date.now() - (maxAgeDays * 24 * 60 * 60 * 1000);
   const ebookOrders = orders.filter(o => {
     const hasEbook = o.line_items?.some(li => li.sku?.startsWith('D-'));
@@ -907,41 +973,16 @@ async function cxFindCustomerOrders(ticketData, explicitOrderNumber, db, env) {
   });
 
   if (ebookOrders.length === 0) {
-    // Maybe customer has older orders — return them as candidates for context, but no auto-match
     const olderEbookOrders = orders.filter(o => o.line_items?.some(li => li.sku?.startsWith('D-')));
-    return { order: null, candidates: olderEbookOrders, found_by: 'no_recent_ebook_orders' };
+    return { orders: [], candidates: olderEbookOrders, found_by: 'no_recent_ebook_orders' };
   }
 
   if (ebookOrders.length === 1) {
-    return { order: ebookOrders[0], candidates: ebookOrders, found_by: 'single_recent_ebook_order' };
+    return { order: ebookOrders[0], orders: ebookOrders, candidates: ebookOrders, found_by: 'single_recent_ebook_order' };
   }
 
-  // Multiple candidates — don't auto-pick, let handler escalate
-  return { order: null, candidates: ebookOrders, found_by: 'multiple_candidates' };
-}
-
-// Legacy single-order function kept for backward compatibility (not used anymore)
-async function cxFindCustomerOrder(ticketData, db, env) {
-  const shopDomain = await cxGetConfig(db, 'shopify_store_domain');
-  const orderMatch = (ticketData.subject || '').match(/#?(\d{1,2}-\d{4,7})/) || (ticketData.firstMessage || '').match(/#?(\d{1,2}-\d{4,7})/);
-  if (orderMatch) {
-    const resp = await fetch(`https://${shopDomain}/admin/api/2024-01/orders.json?name=${encodeURIComponent('#' + orderMatch[1])}&status=any`, { headers: { 'X-Shopify-Access-Token': env.SHOPIFY_ACCESS_TOKEN } });
-    if (resp.ok) {
-      const { orders } = await resp.json();
-      if (orders && orders.length > 0) return orders[0];
-    }
-  }
-  if (ticketData.customerEmail) {
-    const resp = await fetch(`https://${shopDomain}/admin/api/2024-01/orders.json?email=${encodeURIComponent(ticketData.customerEmail)}&status=any&limit=10`, { headers: { 'X-Shopify-Access-Token': env.SHOPIFY_ACCESS_TOKEN } });
-    if (resp.ok) {
-      const { orders } = await resp.json();
-      if (orders && orders.length > 0) {
-        const ebookOrders = orders.filter(o => o.line_items?.some(li => li.sku?.startsWith('D-')));
-        return ebookOrders[0] || orders[0];
-      }
-    }
-  }
-  return null;
+  // Multiple candidates — don't auto-pick
+  return { orders: [], candidates: ebookOrders, found_by: 'multiple_candidates' };
 }
 
 async function cxFetchOrderMetafields(orderId, db, env) {
@@ -1097,6 +1138,132 @@ async function handleCxAgentAPI(request, env, path) {
       const body = await request.json();
       await db.prepare("UPDATE agent_templates SET body = ?, updated_at = datetime('now') WHERE id = ?").bind(body.body, parseInt(tplMatch[1])).run();
       return new Response(JSON.stringify({ updated: true }), { headers: cors });
+    }
+
+    // GET /cx-agent/api/export?start=YYYY-MM-DD&end=YYYY-MM-DD&format=csv
+    // Exports tickets + their decision trace + draft responses as CSV for analysis.
+    if (path === '/cx-agent/api/export' && request.method === 'GET') {
+      const url = new URL(request.url);
+      const start = url.searchParams.get('start'); // YYYY-MM-DD
+      const end = url.searchParams.get('end');     // YYYY-MM-DD (inclusive)
+      const format = url.searchParams.get('format') || 'csv';
+
+      // Build WHERE clause
+      let whereClause = '1=1';
+      const params = [];
+      if (start) {
+        whereClause += ' AND received_at >= ?';
+        params.push(start + ' 00:00:00');
+      }
+      if (end) {
+        whereClause += ' AND received_at <= ?';
+        params.push(end + ' 23:59:59');
+      }
+
+      // Pull all tickets in range
+      const ticketsResult = await db.prepare(`SELECT * FROM agent_tickets WHERE ${whereClause} ORDER BY received_at DESC`).bind(...params).all();
+      const tickets = ticketsResult.results || [];
+
+      if (tickets.length === 0) {
+        return new Response('No tickets in selected date range', { status: 404, headers: { ...cors, 'Content-Type': 'text/plain' } });
+      }
+
+      const ticketIds = tickets.map(t => t.id);
+
+      // Batch fetch all decisions and responses for these tickets
+      // D1 has limits on bind params, so chunk if needed (but we're usually fine under 100 tickets)
+      const placeholders = ticketIds.map(() => '?').join(',');
+      const decisionsResult = await db.prepare(`SELECT * FROM agent_decisions WHERE ticket_id IN (${placeholders}) ORDER BY ticket_id, step_order`).bind(...ticketIds).all();
+      const responsesResult = await db.prepare(`SELECT * FROM agent_responses WHERE ticket_id IN (${placeholders}) ORDER BY ticket_id, created_at`).bind(...ticketIds).all();
+
+      const decisions = decisionsResult.results || [];
+      const responses = responsesResult.results || [];
+
+      // Group by ticket_id
+      const decisionsByTicket = {};
+      for (const d of decisions) {
+        if (!decisionsByTicket[d.ticket_id]) decisionsByTicket[d.ticket_id] = [];
+        decisionsByTicket[d.ticket_id].push(d);
+      }
+      const responsesByTicket = {};
+      for (const r of responses) {
+        if (!responsesByTicket[r.ticket_id]) responsesByTicket[r.ticket_id] = [];
+        responsesByTicket[r.ticket_id].push(r);
+      }
+
+      // Build CSV — one row per ticket with summarized trace + full response
+      const rows = [];
+      const headers = [
+        'ticket_id', 'zendesk_ticket_id', 'received_at', 'completed_at',
+        'customer_email', 'channel', 'subject', 'first_customer_message',
+        'classified_intent', 'intent_confidence', 'is_in_scope',
+        'status', 'final_action', 'error_message',
+        'steps_count', 'total_duration_ms', 'total_tokens', 'total_cost_usd',
+        'step_names', 'decision_trace_summary',
+        'draft_body', 'draft_status', 'posted_to_zendesk_at'
+      ];
+      rows.push(headers);
+
+      for (const t of tickets) {
+        const tDecisions = decisionsByTicket[t.id] || [];
+        const tResponses = responsesByTicket[t.id] || [];
+        const lastResponse = tResponses[tResponses.length - 1] || {};
+
+        const totalDuration = tDecisions.reduce((sum, d) => sum + (d.duration_ms || 0), 0);
+        const totalTokens = tDecisions.reduce((sum, d) => sum + (d.tokens_used || 0), 0);
+        const totalCost = tDecisions.reduce((sum, d) => sum + (d.cost_usd || 0), 0);
+        const stepNames = tDecisions.map(d => d.step_name).join(' > ');
+        const traceSummary = tDecisions.map(d =>
+          `[${d.step_order}] ${d.step_name}: ${d.reasoning || d.status}${d.error_message ? ' ERROR: ' + d.error_message : ''}`
+        ).join(' || ');
+
+        rows.push([
+          t.id,
+          t.zendesk_ticket_id,
+          t.received_at,
+          t.completed_at,
+          t.customer_email,
+          t.channel,
+          t.subject,
+          t.first_customer_message,
+          t.classified_intent,
+          t.intent_confidence,
+          t.is_in_scope,
+          t.status,
+          t.final_action,
+          t.error_message,
+          tDecisions.length,
+          totalDuration,
+          totalTokens,
+          totalCost.toFixed(6),
+          stepNames,
+          traceSummary,
+          lastResponse.draft_body || '',
+          lastResponse.status || '',
+          lastResponse.posted_to_zendesk_at || ''
+        ]);
+      }
+
+      // CSV escape
+      const csv = rows.map(row =>
+        row.map(cell => {
+          if (cell === null || cell === undefined) return '';
+          const s = String(cell);
+          if (s.includes(',') || s.includes('"') || s.includes('\n') || s.includes('\r')) {
+            return '"' + s.replaceAll('"', '""') + '"';
+          }
+          return s;
+        }).join(',')
+      ).join('\r\n');
+
+      const dateStr = new Date().toISOString().slice(0, 10);
+      return new Response(csv, {
+        headers: {
+          ...cors,
+          'Content-Type': 'text/csv; charset=utf-8',
+          'Content-Disposition': `attachment; filename="cx-agent-export-${dateStr}.csv"`
+        }
+      });
     }
 
     return new Response(JSON.stringify({ error: 'Not found' }), { status: 404, headers: cors });
