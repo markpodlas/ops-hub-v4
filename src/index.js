@@ -459,7 +459,30 @@ async function initCxAgentTables(db) {
       db.prepare("INSERT INTO agent_config (key, value, value_type, description) VALUES (?, ?, ?, ?)").bind('support_staff_ids', '[29324864593179,16129176780315,32863955019931,14117981153307]', 'json', 'Zendesk support staff IDs'),
       db.prepare("INSERT INTO agent_config (key, value, value_type, description) VALUES (?, ?, ?, ?)").bind('max_order_age_days', '90', 'number', 'Max age (days) of orders the agent will auto-respond about'),
       db.prepare("INSERT INTO agent_config (key, value, value_type, description) VALUES (?, ?, ?, ?)").bind('require_email_match', 'true', 'boolean', 'If true, require Zendesk email matches Shopify order email (unless order number in ticket)'),
+      db.prepare("INSERT INTO agent_config (key, value, value_type, description) VALUES (?, ?, ?, ?)").bind('suggested_intents', '["product_info","shipping_delivery","education_content","order_general","returns_damaged","billing_payment","account","refund_cancel"]', 'json', 'Intents where agent drafts AI suggestions (vs specialized handler)'),
+      db.prepare("INSERT INTO agent_config (key, value, value_type, description) VALUES (?, ?, ?, ?)").bind('noise_suggestion_enabled', 'true', 'boolean', 'For noise-classified tickets, post a close-recommendation note'),
+      db.prepare("INSERT INTO agent_config (key, value, value_type, description) VALUES (?, ?, ?, ?)").bind('help_center_enabled', 'true', 'boolean', 'Query Zendesk Help Center for article context when drafting suggestions'),
+      db.prepare("INSERT INTO agent_config (key, value, value_type, description) VALUES (?, ?, ?, ?)").bind('help_center_max_articles', '3', 'number', 'Max articles to include as context per suggestion'),
+      db.prepare("INSERT INTO agent_config (key, value, value_type, description) VALUES (?, ?, ?, ?)").bind('apply_zendesk_tags', 'true', 'boolean', 'Apply ai-processed, ai-drafted, etc tags to Zendesk tickets'),
     ]);
+  }
+
+  // v4.4 migration: add new config keys if they don't already exist
+  // (the block above only runs on empty DB; this catches existing deployments)
+  const v44Keys = [
+    ['suggested_intents', '["product_info","shipping_delivery","education_content","order_general","returns_damaged","billing_payment","account","refund_cancel"]', 'json', 'Intents where agent drafts AI suggestions (vs specialized handler)'],
+    ['noise_suggestion_enabled', 'true', 'boolean', 'For noise-classified tickets, post a close-recommendation note'],
+    ['help_center_enabled', 'true', 'boolean', 'Query Zendesk Help Center for article context when drafting suggestions'],
+    ['help_center_max_articles', '3', 'number', 'Max articles to include as context per suggestion'],
+    ['apply_zendesk_tags', 'true', 'boolean', 'Apply ai-processed, ai-drafted, etc tags to Zendesk tickets'],
+    ['max_order_age_days', '90', 'number', 'Max age (days) of orders the agent will auto-respond about'],
+    ['require_email_match', 'true', 'boolean', 'If true, require Zendesk email matches Shopify order email (unless order number in ticket)'],
+  ];
+  for (const [key, value, value_type, description] of v44Keys) {
+    const exists = await db.prepare("SELECT 1 FROM agent_config WHERE key = ?").bind(key).first();
+    if (!exists) {
+      await db.prepare("INSERT INTO agent_config (key, value, value_type, description) VALUES (?, ?, ?, ?)").bind(key, value, value_type, description).run();
+    }
   }
 
   const existingTpl = await db.prepare("SELECT COUNT(*) as c FROM agent_templates").first();
@@ -534,32 +557,42 @@ async function runCxAgentPipeline(ticketId, ticketData, db, env) {
     const intent = await tracer.trace('intent_classification', async () => cxClassifyIntent(ticketData, db, env));
     await db.prepare(`UPDATE agent_tickets SET classified_intent = ?, intent_confidence = ? WHERE id = ?`).bind(intent.intent, intent.confidence, ticketId).run();
 
-    const scopeCheck = await tracer.trace('scope_check', async () => {
-      const scopedIntents = await cxGetConfig(db, 'scoped_intents');
+    // NEW: 3-way intent routing
+    const routing = await tracer.trace('routing_decision', async () => {
+      const scopedIntents = await cxGetConfig(db, 'scoped_intents');        // specialized handlers (e.g. digital_access)
+      const suggestedIntents = await cxGetConfig(db, 'suggested_intents');  // AI-drafted suggestions via KB
       const hardEscalateTopics = await cxGetConfig(db, 'hard_escalate_topics');
       const minConfidence = await cxGetConfig(db, 'min_confidence_to_respond');
-      const isInScope = scopedIntents.includes(intent.intent);
-      const shouldEscalate = hardEscalateTopics.some(t => intent.topics?.includes(t));
-      const confidenceOk = intent.confidence >= minConfidence;
-      return {
-        in_scope: isInScope && !shouldEscalate && confidenceOk,
-        reason: !isInScope ? 'Intent not in handled scope'
-              : shouldEscalate ? 'Topic requires human review'
-              : !confidenceOk ? `Confidence ${intent.confidence} below threshold ${minConfidence}`
-              : 'In scope'
-      };
+      const noiseSuggestionEnabled = await cxGetConfig(db, 'noise_suggestion_enabled');
+
+      const hasHardTopic = hardEscalateTopics.some(t => intent.topics?.includes(t));
+      const lowConfidence = intent.confidence < minConfidence;
+
+      if (hasHardTopic) return { route: 'escalate', reason: `Topic requires human review: ${intent.topics.join(', ')}` };
+      if (lowConfidence) return { route: 'escalate', reason: `Confidence ${intent.confidence} below threshold ${minConfidence}` };
+
+      if (intent.intent === 'noise' && noiseSuggestionEnabled) {
+        return { route: 'noise_suggest', reason: 'Noise classification — suggesting close' };
+      }
+      if (scopedIntents.includes(intent.intent)) {
+        return { route: 'handled', reason: `Specialized handler for: ${intent.intent}` };
+      }
+      if (suggestedIntents.includes(intent.intent)) {
+        return { route: 'suggest', reason: `AI suggestion drafted for: ${intent.intent}` };
+      }
+      return { route: 'escalate', reason: `No handler or suggestion path for: ${intent.intent}` };
     });
 
-    if (!scopeCheck.in_scope) {
-      await cxEscalate(ticketId, ticketData, intent, scopeCheck.reason, db, env, tracer);
-      return;
-    }
-    await db.prepare('UPDATE agent_tickets SET is_in_scope = 1 WHERE id = ?').bind(ticketId).run();
-
-    if (intent.intent === 'digital_access') {
+    if (routing.route === 'handled' && intent.intent === 'digital_access') {
+      await db.prepare('UPDATE agent_tickets SET is_in_scope = 1 WHERE id = ?').bind(ticketId).run();
       await cxHandleDigitalAccess(ticketId, ticketData, intent, db, env, tracer);
+    } else if (routing.route === 'suggest') {
+      await db.prepare('UPDATE agent_tickets SET is_in_scope = 1 WHERE id = ?').bind(ticketId).run();
+      await cxDraftGeneralSuggestion(ticketId, ticketData, intent, db, env, tracer);
+    } else if (routing.route === 'noise_suggest') {
+      await cxSuggestClose(ticketId, ticketData, intent, db, env, tracer);
     } else {
-      await cxEscalate(ticketId, ticketData, intent, `No handler for intent: ${intent.intent}`, db, env, tracer);
+      await cxEscalate(ticketId, ticketData, intent, routing.reason, db, env, tracer);
     }
   } catch (err) {
     console.error(`CX agent pipeline error for ticket ${ticketId}:`, err);
@@ -806,15 +839,12 @@ async function cxDeliverExistingCodesMulti(ticketId, ticketData, fulfillments, d
     const template = await cxGetTemplate(db, 'digital_access_success');
     const plural = allParsedCodes.length > 1;
 
-    // Product titles list (dedupe)
     const productTitles = Array.from(new Set(allParsedCodes.map(p => p.title || 'your ebook'))).join(' and ');
-
-    // Codes list
     const codesFormatted = allParsedCodes.length > 1
       ? allParsedCodes.map(p => `  ${p.code}${p.title ? ` (${p.title})` : ''}`).join('\n')
       : allParsedCodes[0].code;
 
-    let body = template.body
+    const replyBody = template.body
       .replace('{customer_first_name}', customerFirstName)
       .replace('{product_titles}', productTitles)
       .replaceAll('{plural_s}', plural ? 's' : '')
@@ -822,15 +852,35 @@ async function cxDeliverExistingCodesMulti(ticketId, ticketData, fulfillments, d
       .replace('{codes}', codesFormatted)
       .replaceAll('{this_these}', plural ? 'these' : 'this');
 
-    // If there were problematic orders mixed in, add a human-visible note to the response
-    // (this is internal_note content, so it's ok to have meta info for the human)
-    if (invalidNotes && invalidNotes.length > 0) {
-      const notes = invalidNotes.map(i => `  ${i.name}: ${Array.isArray(i.issues) ? i.issues.join('; ') : i.issues}`).join('\n');
-      body += `\n\n---\n[AGENT NOTE TO HUMAN REVIEWER]\nCustomer may have mentioned these other orders that were NOT included in the response above:\n${notes}\nReview whether these need human follow-up.`;
+    // Build context + warning lines for the branded internal note
+    const contextLines = [
+      `Intent: digital_access (high confidence specialized handler)`,
+      `Codes: ${allParsedCodes.length} code(s) across ${fulfillments.length} order(s)`,
+    ];
+    for (const f of fulfillments) {
+      contextLines.push(`Order ${f.order.name} (${new Date(f.order.created_at).toLocaleDateString()}): ${f.order.financial_status}, status metafield=${f.vsStatus}`);
     }
 
+    const warningLines = [];
+    if (invalidNotes && invalidNotes.length > 0) {
+      warningLines.push('Customer mentioned other orders that were NOT included above:');
+      for (const i of invalidNotes) {
+        const issuesText = Array.isArray(i.issues) ? i.issues.join('; ') : i.issues;
+        warningLines.push(`  ${i.name}: ${issuesText}`);
+      }
+      warningLines.push('Review whether those need separate human follow-up.');
+    }
+
+    const noteBody = cxFormatNote('reply', {
+      body: replyBody,
+      confidence: 0.95,
+      contextLines,
+      warningLines: warningLines.length ? warningLines : undefined
+    });
+
     return {
-      body,
+      body: replyBody,          // raw reply (what CX would copy/paste)
+      noteBody,                 // branded note body (what gets posted to Zendesk)
       confidence: 0.95,
       reasoning: `Delivering ${allParsedCodes.length} code(s) across ${fulfillments.length} order(s): ${fulfillments.map(f => f.order.name).join(', ')}${invalidNotes.length ? ` [+${invalidNotes.length} flagged for human]` : ''}`,
       data_sources: {
@@ -843,8 +893,15 @@ async function cxDeliverExistingCodesMulti(ticketId, ticketData, fulfillments, d
     };
   });
 
-  const responseId = await cxSaveResponse(db, ticketId, response);
-  await tracer.trace('post_internal_note', async () => cxPostInternalNote(ticketData.zendeskTicketId, response.body, db, env));
+  // Save the raw reply as the canonical draft (for future auto-reply mode, we send this verbatim)
+  const responseId = await cxSaveResponse(db, ticketId, {
+    body: response.body,
+    confidence: response.confidence,
+    reasoning: response.reasoning,
+    data_sources: response.data_sources
+  });
+  await tracer.trace('post_internal_note', async () => cxPostInternalNote(ticketData.zendeskTicketId, response.noteBody, db, env));
+  await tracer.trace('apply_tags', async () => cxApplyZendeskTags(ticketData.zendeskTicketId, ['ai-processed', 'ai-drafted', 'ai-intent-digital_access'], db, env));
   await db.prepare(`UPDATE agent_responses SET status = 'posted_as_note', posted_to_zendesk_at = datetime('now') WHERE id = ?`).bind(responseId).run();
   await db.prepare(`UPDATE agent_tickets SET status = 'drafted', final_action = 'internal_note_posted', completed_at = datetime('now') WHERE id = ?`).bind(ticketId).run();
 }
@@ -864,31 +921,442 @@ async function cxTriggerRegeneration(ticketId, ticketData, order, db, env, trace
   const response = await tracer.trace('draft_response', async () => {
     const customerFirstName = order.customer?.first_name || cxFirstNameFromEmail(ticketData.customerEmail);
     const template = await cxGetTemplate(db, 'digital_access_regenerating');
-    const body = template.body.replace('{customer_first_name}', customerFirstName);
-    return { body, confidence: 0.85, reasoning: `Order ${order.name} had no valid codes. Triggered regeneration via n8n.`,
-      data_sources: { order_id: order.id, order_number: order.name, action: 'regeneration_triggered' } };
+    const replyBody = template.body.replace('{customer_first_name}', customerFirstName);
+
+    const noteBody = cxFormatNote('reply', {
+      body: replyBody,
+      confidence: 0.85,
+      contextLines: [
+        `Intent: digital_access (regeneration triggered)`,
+        `Order ${order.name}: ${order.financial_status}`,
+        `n8n regeneration webhook fired; codes should be on the way`
+      ],
+      warningLines: ['Monitor whether regeneration actually completes. If customer replies again with the same issue, escalate.']
+    });
+
+    return {
+      body: replyBody,
+      noteBody,
+      confidence: 0.85,
+      reasoning: `Order ${order.name} had no valid codes. Triggered regeneration via n8n.`,
+      data_sources: { order_id: order.id, order_number: order.name, action: 'regeneration_triggered' }
+    };
   });
-  const responseId = await cxSaveResponse(db, ticketId, response);
-  await tracer.trace('post_internal_note', async () => cxPostInternalNote(ticketData.zendeskTicketId, response.body, db, env));
+  const responseId = await cxSaveResponse(db, ticketId, {
+    body: response.body, confidence: response.confidence, reasoning: response.reasoning, data_sources: response.data_sources
+  });
+  await tracer.trace('post_internal_note', async () => cxPostInternalNote(ticketData.zendeskTicketId, response.noteBody, db, env));
+  await tracer.trace('apply_tags', async () => cxApplyZendeskTags(ticketData.zendeskTicketId, ['ai-processed', 'ai-drafted', 'ai-intent-digital_access', 'ai-regeneration-triggered'], db, env));
   await db.prepare(`UPDATE agent_responses SET status = 'posted_as_note', posted_to_zendesk_at = datetime('now') WHERE id = ?`).bind(responseId).run();
   await db.prepare(`UPDATE agent_tickets SET status = 'drafted', final_action = 'internal_note_posted', completed_at = datetime('now') WHERE id = ?`).bind(ticketId).run();
 }
 
+// ==========================================================================
+// v4.4: BRANDED INTERNAL NOTE FORMAT
+// ==========================================================================
+
+function cxFormatNote(kind, opts) {
+  // kind: 'reply' (high confidence draft) | 'suggestion' (general AI suggestion)
+  //      | 'escalation' (human needed) | 'noise_close' (suggested close)
+  const DIVIDER = '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━';
+  const parts = [];
+
+  if (kind === 'reply') {
+    parts.push(DIVIDER);
+    parts.push(`✨ AI SUGGESTED REPLY — confidence ${Math.round((opts.confidence || 0) * 100)}%`);
+    parts.push(DIVIDER);
+    parts.push('');
+    parts.push(opts.body);
+    parts.push('');
+    parts.push(DIVIDER);
+    parts.push('📋 CONTEXT');
+    if (opts.contextLines?.length) {
+      for (const line of opts.contextLines) parts.push('  • ' + line);
+    }
+    if (opts.warningLines?.length) {
+      parts.push('');
+      parts.push('⚠️  WARNINGS / THINGS TO VERIFY:');
+      for (const line of opts.warningLines) parts.push('  • ' + line);
+    }
+    parts.push('');
+    parts.push('▸ To use: copy the reply above and paste into a customer-facing reply.');
+    parts.push('▸ To reject: reply to customer manually and ignore this suggestion.');
+    parts.push(DIVIDER);
+  } else if (kind === 'suggestion') {
+    parts.push(DIVIDER);
+    parts.push(`💡 AI SUGGESTION — review carefully before sending`);
+    parts.push(`   Classified as: ${opts.intent} (confidence ${Math.round((opts.confidence || 0) * 100)}%)`);
+    parts.push(DIVIDER);
+    parts.push('');
+    parts.push(opts.body);
+    parts.push('');
+    parts.push(DIVIDER);
+    parts.push('📋 CONTEXT USED');
+    if (opts.contextLines?.length) {
+      for (const line of opts.contextLines) parts.push('  • ' + line);
+    }
+    if (opts.articlesUsed?.length) {
+      parts.push('');
+      parts.push('📚 Help Center articles referenced:');
+      for (const art of opts.articlesUsed) {
+        parts.push(`  • ${art.title}`);
+        if (art.url) parts.push(`    ${art.url}`);
+      }
+    }
+    if (opts.warningLines?.length) {
+      parts.push('');
+      parts.push('⚠️  REVIEW CAREFULLY:');
+      for (const line of opts.warningLines) parts.push('  • ' + line);
+    }
+    parts.push('');
+    parts.push('▸ This is a general suggestion from the AI, not a specialized handler.');
+    parts.push('▸ Verify accuracy against the customer\'s specific situation before sending.');
+    parts.push(DIVIDER);
+  } else if (kind === 'escalation') {
+    parts.push(DIVIDER);
+    parts.push(`⚠️  AI AGENT — HUMAN REVIEW NEEDED`);
+    parts.push(DIVIDER);
+    parts.push('');
+    parts.push(`Reason: ${opts.reason}`);
+    parts.push('');
+    parts.push(`Classified as: ${opts.intent || 'unclassified'} (confidence ${Math.round((opts.confidence || 0) * 100)}%)`);
+    if (opts.messageSnippet) {
+      parts.push('');
+      parts.push('Customer said:');
+      parts.push(`  "${opts.messageSnippet}"`);
+    }
+    if (opts.whatITried?.length) {
+      parts.push('');
+      parts.push('What the AI tried:');
+      for (const line of opts.whatITried) parts.push('  • ' + line);
+    }
+    if (opts.dataFound?.length) {
+      parts.push('');
+      parts.push('Data found:');
+      for (const line of opts.dataFound) parts.push('  • ' + line);
+    }
+    if (opts.likelyExplanation) {
+      parts.push('');
+      parts.push(`Likely explanation: ${opts.likelyExplanation}`);
+    }
+    if (opts.suggestedNextStep) {
+      parts.push('');
+      parts.push(`Suggested next step: ${opts.suggestedNextStep}`);
+    }
+    parts.push('');
+    parts.push(DIVIDER);
+  } else if (kind === 'noise_close') {
+    parts.push(DIVIDER);
+    parts.push(`🗑️  AI AGENT — RECOMMEND CLOSING WITHOUT REPLY`);
+    parts.push(`   Classified as: noise (confidence ${Math.round((opts.confidence || 0) * 100)}%)`);
+    parts.push(DIVIDER);
+    parts.push('');
+    parts.push(`Reason: ${opts.reason || 'This looks like an automated notification, spam, or system-generated message that does not require a response.'}`);
+    if (opts.messageSnippet) {
+      parts.push('');
+      parts.push(`Message preview: ${opts.messageSnippet}`);
+    }
+    parts.push('');
+    parts.push('▸ If this is actually important, reply to customer + remove the `ai-suggests-close` tag.');
+    parts.push('▸ Otherwise: close this ticket without reply to train the agent.');
+    parts.push(DIVIDER);
+  }
+
+  return parts.join('\n');
+}
+
+// ==========================================================================
+// v4.4: ZENDESK TAGS
+// ==========================================================================
+
+async function cxApplyZendeskTags(ticketId, tags, db, env) {
+  const applyTags = await cxGetConfig(db, 'apply_zendesk_tags');
+  if (!applyTags) return { skipped: true };
+  const subdomain = await cxGetConfig(db, 'zendesk_subdomain');
+  const auth = btoa(`${env.ZENDESK_EMAIL}/token:${env.ZENDESK_API_TOKEN}`);
+  try {
+    const resp = await fetch(`https://${subdomain}.zendesk.com/api/v2/tickets/${ticketId}/tags.json`, {
+      method: 'PUT',
+      headers: { Authorization: `Basic ${auth}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ tags })
+    });
+    return { status: resp.status, ok: resp.ok, tags };
+  } catch (err) {
+    return { error: err.message, ok: false };
+  }
+}
+
+// ==========================================================================
+// v4.4: ZENDESK HELP CENTER SEARCH
+// ==========================================================================
+
+async function cxSearchHelpCenter(query, db, env, maxResults = 3) {
+  const enabled = await cxGetConfig(db, 'help_center_enabled');
+  if (!enabled) return [];
+  const subdomain = await cxGetConfig(db, 'zendesk_subdomain');
+  const auth = btoa(`${env.ZENDESK_EMAIL}/token:${env.ZENDESK_API_TOKEN}`);
+  try {
+    // Help Center has a search API. Unauthenticated for public articles, but auth works too.
+    const url = `https://${subdomain}.zendesk.com/api/v2/help_center/articles/search.json?query=${encodeURIComponent(query)}&per_page=${maxResults}`;
+    const resp = await fetch(url, { headers: { Authorization: `Basic ${auth}` } });
+    if (!resp.ok) return [];
+    const data = await resp.json();
+    return (data.results || []).slice(0, maxResults).map(a => ({
+      id: a.id,
+      title: a.title,
+      url: a.html_url,
+      // Strip HTML from body to give clean text to Claude
+      body: (a.body || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().substring(0, 3000)
+    }));
+  } catch (err) {
+    console.error('Help Center search error:', err);
+    return [];
+  }
+}
+
+// ==========================================================================
+// v4.4: GENERAL AI SUGGESTION (uses Help Center context)
+// ==========================================================================
+
+async function cxDraftGeneralSuggestion(ticketId, ticketData, intent, db, env, tracer) {
+  // STEP: Look up any orders for context (non-blocking — suggestion works without them)
+  const orderContext = await tracer.trace('shopify_context_lookup', async () => {
+    if (!ticketData.customerEmail) return { orders: [], note: 'no email' };
+    const shopDomain = await cxGetConfig(db, 'shopify_store_domain');
+    try {
+      const resp = await fetch(
+        `https://${shopDomain}/admin/api/2024-01/orders.json?email=${encodeURIComponent(ticketData.customerEmail)}&status=any&limit=5`,
+        { headers: { 'X-Shopify-Access-Token': env.SHOPIFY_ACCESS_TOKEN } }
+      );
+      if (!resp.ok) return { orders: [], note: `api ${resp.status}` };
+      const { orders = [] } = await resp.json();
+      return {
+        orders: orders.slice(0, 5).map(o => ({
+          name: o.name,
+          created_at: o.created_at,
+          financial_status: o.financial_status,
+          fulfillment_status: o.fulfillment_status,
+          total: o.total_price,
+          items: (o.line_items || []).map(li => `${li.quantity}× ${li.title}${li.sku ? ` (${li.sku})` : ''}`).join(', ')
+        })),
+        count: orders.length
+      };
+    } catch (err) {
+      return { orders: [], error: err.message };
+    }
+  });
+
+  // STEP: Search Help Center for relevant articles
+  const maxArticles = await cxGetConfig(db, 'help_center_max_articles') || 3;
+  const searchQuery = ticketData.subject || ticketData.firstMessage?.substring(0, 200) || '';
+  const articles = await tracer.trace('help_center_search', async () => {
+    const results = await cxSearchHelpCenter(searchQuery, db, env, maxArticles);
+    return { count: results.length, titles: results.map(a => a.title), _raw: results };
+  });
+
+  // STEP: Draft the response with Claude
+  const response = await tracer.trace('draft_suggestion', async () => {
+    const model = await cxGetConfig(db, 'anthropic_model');
+    const customerFirstName = ticketData.ticket?.requester?.name?.split(' ')[0]
+      || cxFirstNameFromEmail(ticketData.customerEmail);
+
+    const ordersContext = orderContext.orders?.length
+      ? orderContext.orders.map(o => `  - Order ${o.name} (${new Date(o.created_at).toLocaleDateString()}): ${o.items}, financial_status=${o.financial_status}, fulfillment=${o.fulfillment_status || 'none'}, total=$${o.total}`).join('\n')
+      : '  (no recent orders found on file)';
+
+    const articlesContext = articles._raw?.length
+      ? articles._raw.map((a, i) => `[Article ${i+1}] ${a.title}\nURL: ${a.url}\nContent: ${a.body}\n`).join('\n---\n')
+      : '(no relevant help center articles found)';
+
+    const systemPrompt = `You are Kristine, founder of Nurse In The Making (NITM), a nursing education company. Write a helpful customer service reply in Kristine's warm, supportive tone.
+
+Your tone/style rules:
+- Open with "Hi [FirstName]," (use their first name)
+- Warm, encouraging, supportive — you care about future nurses succeeding
+- Match the empathy level to the customer's situation (if they're frustrated, acknowledge it without being sappy)
+- Keep replies concise — get to the answer, don't pad
+- Close with "Happy studying, future nurse!" followed by "Kristine :)" on its own line
+- Use product names exactly as written: "The Complete Nursing School Bundle®", "NurseInTheMaking+", "VitalSource Bookshelf"
+- Link to Help Center articles inline when relevant using markdown: [article title](url)
+
+Response rules:
+- Ground your answer in the Help Center articles below whenever they apply
+- If the articles don't cover the question, give your best general answer but be honest that you'd want a human to follow up
+- If the customer's question is about a specific order problem that requires looking up data you don't have, say so
+- DO NOT invent facts, policies, or product details not in the articles
+- DO NOT promise refunds, exceptions, or account changes — say you'll check with the team
+- If unsure, say so — it's better to suggest a human follow-up than make something up
+
+Return ONLY the reply body. No subject line, no JSON, no commentary.`;
+
+    const userPrompt = `Customer message:
+Subject: ${ticketData.subject || '(none)'}
+From: ${ticketData.customerEmail}
+${ticketData.firstMessage?.substring(0, 2500) || ''}
+
+---
+This customer's recent orders:
+${ordersContext}
+
+---
+Help Center articles that might be relevant:
+${articlesContext}
+
+---
+Intent classified as: ${intent.intent} (confidence ${intent.confidence})
+
+Write the reply as Kristine.`;
+
+    const claudeResp = await cxCallClaude(env, model, systemPrompt, userPrompt, 1500);
+    return {
+      body: claudeResp.content.trim(),
+      confidence: intent.confidence,
+      reasoning: `General AI suggestion for ${intent.intent}`,
+      data_sources: {
+        intent: intent.intent,
+        orders_found: orderContext.orders?.length || 0,
+        articles_used: articles._raw?.length || 0
+      },
+      _tokens: claudeResp.tokens,
+      _cost: claudeResp.cost
+    };
+  });
+
+  // STEP: Format as branded internal note
+  const contextLines = [];
+  if (orderContext.orders?.length) {
+    contextLines.push(`Customer has ${orderContext.orders.length} recent order(s) on file`);
+    for (const o of orderContext.orders.slice(0, 2)) {
+      contextLines.push(`${o.name} (${new Date(o.created_at).toLocaleDateString()}): ${o.financial_status}/${o.fulfillment_status || '—'}`);
+    }
+  } else {
+    contextLines.push('No orders found for this email');
+  }
+  contextLines.push(`Intent: ${intent.intent} (${Math.round(intent.confidence * 100)}%)`);
+
+  const warningLines = [];
+  if (intent.intent === 'refund_cancel' || intent.intent === 'returns_damaged') {
+    warningLines.push('This involves a refund/return — verify policy before committing');
+  }
+  if (intent.confidence < 0.85) {
+    warningLines.push('Low confidence classification — re-read the customer message carefully');
+  }
+  if (!articles._raw?.length) {
+    warningLines.push('No Help Center articles matched — answer is from AI general knowledge only');
+  }
+
+  const noteBody = cxFormatNote('suggestion', {
+    body: response.body,
+    intent: intent.intent,
+    confidence: response.confidence,
+    contextLines,
+    articlesUsed: articles._raw || [],
+    warningLines
+  });
+
+  const responseId = await cxSaveResponse(db, ticketId, {
+    body: response.body,
+    confidence: response.confidence,
+    reasoning: response.reasoning,
+    data_sources: response.data_sources
+  });
+
+  await tracer.trace('post_internal_note', async () => cxPostInternalNote(ticketData.zendeskTicketId, noteBody, db, env));
+  await tracer.trace('apply_tags', async () => cxApplyZendeskTags(ticketData.zendeskTicketId, ['ai-processed', 'ai-suggested', `ai-intent-${intent.intent}`], db, env));
+
+  await db.prepare(`UPDATE agent_responses SET status = 'posted_as_note', posted_to_zendesk_at = datetime('now') WHERE id = ?`).bind(responseId).run();
+  await db.prepare(`UPDATE agent_tickets SET status = 'drafted', final_action = 'suggestion_posted', completed_at = datetime('now') WHERE id = ?`).bind(ticketId).run();
+}
+
+// ==========================================================================
+// v4.4: NOISE CLOSE SUGGESTION
+// ==========================================================================
+
+async function cxSuggestClose(ticketId, ticketData, intent, db, env, tracer) {
+  const noteBody = cxFormatNote('noise_close', {
+    confidence: intent.confidence,
+    reason: intent.reasoning,
+    messageSnippet: (ticketData.firstMessage || '').substring(0, 200)
+  });
+
+  const responseId = await cxSaveResponse(db, ticketId, {
+    body: noteBody,
+    confidence: intent.confidence,
+    reasoning: intent.reasoning || 'Classified as noise',
+    data_sources: { intent: 'noise', confidence: intent.confidence }
+  });
+
+  await tracer.trace('post_internal_note', async () => cxPostInternalNote(ticketData.zendeskTicketId, noteBody, db, env));
+  await tracer.trace('apply_tags', async () => cxApplyZendeskTags(ticketData.zendeskTicketId, ['ai-processed', 'ai-suggests-close'], db, env));
+
+  await db.prepare(`UPDATE agent_responses SET status = 'posted_as_note', posted_to_zendesk_at = datetime('now') WHERE id = ?`).bind(responseId).run();
+  await db.prepare(`UPDATE agent_tickets SET status = 'drafted', final_action = 'suggest_close', completed_at = datetime('now') WHERE id = ?`).bind(ticketId).run();
+}
+
+// ==========================================================================
+// UPDATED: cxEscalate (v4.4 — branded format + tags + show work)
+// ==========================================================================
+
 async function cxEscalate(ticketId, ticketData, intent, reason, db, env, tracer, extraData = {}) {
   const response = await tracer.trace('draft_escalation', async () => {
-    const template = await cxGetTemplate(db, 'escalation_note');
-    const dataFound = Object.keys(extraData).length > 0 ? Object.entries(extraData).map(([k, v]) => `  - ${k}: ${v}`).join('\n') : '  (none)';
-    const body = template.body
-      .replace('{escalation_reason}', reason)
-      .replace('{intent}', intent?.intent || 'unclassified')
-      .replace('{confidence}', (intent?.confidence || 0).toFixed(2))
-      .replace('{message_summary}', (ticketData.firstMessage || '').substring(0, 300))
-      .replace('{data_found}', dataFound)
-      .replace('{recommended_action}', 'Human review required');
-    return { body, confidence: 1.0, reasoning: reason, data_sources: extraData };
+    // Derive "what I tried" from the reason string (simple heuristic)
+    const whatITried = [];
+    if (reason.includes('order')) {
+      whatITried.push(`Looked up Shopify orders by email: ${ticketData.customerEmail || '(no email)'}`);
+      if (extraData.explicit_order_number) whatITried.push(`Looked up specific order number: ${extraData.explicit_order_number}`);
+      if (extraData.candidate_orders) whatITried.push(`Found ${String(extraData.candidate_orders).split('\n').length - 1} candidate orders (see below)`);
+    }
+    if (reason.includes('afeguard') || reason.includes('cancel') || reason.includes('refund')) {
+      whatITried.push('Ran safeguard checks on the order (cancelled/refunded/age/email)');
+    }
+
+    // Build dataFound lines
+    const dataFound = [];
+    for (const [k, v] of Object.entries(extraData)) {
+      if (v !== null && v !== undefined && v !== '') {
+        dataFound.push(`${k}: ${typeof v === 'string' ? v : JSON.stringify(v)}`);
+      }
+    }
+
+    // Heuristic: likely explanation
+    let likelyExplanation = null;
+    if (reason.includes('Could not find') && ticketData.firstMessage?.toLowerCase().includes('gift')) {
+      likelyExplanation = 'Customer mentions a gift — order was likely placed with a different email than theirs.';
+    } else if (reason.includes('Email mismatch')) {
+      likelyExplanation = 'Customer may have checked out with a different email (common with PayPal/guest checkout).';
+    } else if (reason.includes('cancelled')) {
+      likelyExplanation = 'Order was cancelled; codes should NOT be delivered even if customer asks.';
+    } else if (reason.includes('Intent not') || reason.includes('No handler') || reason.includes('No handler or suggestion')) {
+      likelyExplanation = `Intent '${intent?.intent}' is not in the auto-handle or auto-suggest scope. Human review needed.`;
+    }
+
+    let suggestedNextStep = null;
+    if (reason.includes('Could not find') && ticketData.firstMessage?.toLowerCase().includes('gift')) {
+      suggestedNextStep = 'Ask customer for the order number OR the email used for checkout.';
+    } else if (reason.includes('Email mismatch')) {
+      suggestedNextStep = 'Verify the customer\'s identity before sending codes. Ask for their order number.';
+    } else if (reason.includes('cancelled') || reason.includes('refunded')) {
+      suggestedNextStep = 'Reply explaining the order was cancelled/refunded. Do not send codes.';
+    }
+
+    const noteBody = cxFormatNote('escalation', {
+      intent: intent?.intent,
+      confidence: intent?.confidence || 0,
+      reason,
+      messageSnippet: (ticketData.firstMessage || '').substring(0, 250),
+      whatITried: whatITried.length ? whatITried : undefined,
+      dataFound: dataFound.length ? dataFound : undefined,
+      likelyExplanation,
+      suggestedNextStep
+    });
+
+    return { body: noteBody, confidence: 1.0, reasoning: reason, data_sources: extraData };
   });
+
   const responseId = await cxSaveResponse(db, ticketId, response);
   await tracer.trace('post_escalation_note', async () => cxPostInternalNote(ticketData.zendeskTicketId, response.body, db, env));
+  await tracer.trace('apply_tags', async () => cxApplyZendeskTags(ticketData.zendeskTicketId, ['ai-processed', 'ai-escalated', intent?.intent ? `ai-intent-${intent.intent}` : 'ai-intent-unknown'], db, env));
+
   await db.prepare(`UPDATE agent_responses SET status = 'posted_as_note', posted_to_zendesk_at = datetime('now') WHERE id = ?`).bind(responseId).run();
   await db.prepare(`UPDATE agent_tickets SET status = 'escalated', final_action = 'escalated', completed_at = datetime('now') WHERE id = ?`).bind(ticketId).run();
 }

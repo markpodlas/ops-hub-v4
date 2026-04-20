@@ -300,7 +300,7 @@ async function loadTickets() {
         <td>${t.classified_intent ? `<span class="pill pill-info mono">${t.classified_intent}</span>` : '<span class="pill pill-neutral">—</span>'}</td>
         <td class="mono">${t.intent_confidence ? (t.intent_confidence * 100).toFixed(0) + '%' : '—'}</td>
         <td>${statusPill(t.status)}</td>
-        <td style="font-size:12px;color:var(--text-muted)">${t.final_action || ''}</td>
+        <td>${actionPill(t.final_action)}</td>
       </tr>
     `).join('');
   } catch (e) {
@@ -475,6 +475,18 @@ function statusPill(status) {
     error: 'pill-error'
   };
   return `<span class="pill ${map[status] || 'pill-neutral'}">${status}</span>`;
+}
+
+function actionPill(action) {
+  if (!action) return '<span class="pill pill-neutral">—</span>';
+  const labels = {
+    'internal_note_posted': { label: '✨ Draft reply', cls: 'pill-success' },
+    'suggestion_posted':    { label: '💡 AI suggestion', cls: 'pill-info' },
+    'suggest_close':        { label: '🗑️ Recommend close', cls: 'pill-warn' },
+    'escalated':            { label: '⚠️ Escalated', cls: 'pill-warn' }
+  };
+  const { label, cls } = labels[action] || { label: action, cls: 'pill-neutral' };
+  return `<span class="pill ${cls}" style="font-size:11px">${label}</span>`;
 }
 
 function formatDate(s) {
