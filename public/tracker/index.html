@@ -62,8 +62,8 @@ const labelColors = { 'high-performer':C.green, 'grow-hero':C.purple, solid:C.am
 const labelEmoji = { 'high-performer':'', 'grow-hero':'', solid:'', normal:'' };
 
 const store = {
-  save: async (d) => { try { await fetch('/api/data', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(d) }); } catch(e) { console.error('Save failed', e); } },
-  load: async () => { try { const r = await fetch('/api/data'); if (!r.ok) return null; return await r.json(); } catch(e) { return null; } },
+  save: async (d) => { try { await fetch('/tracker/api/data', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(d) }); } catch(e) { console.error('Save failed', e); } },
+  load: async () => { try { const r = await fetch('/tracker/api/data'); if (!r.ok) return null; return await r.json(); } catch(e) { return null; } },
 };
 
 const parseCSV = (text) => {
@@ -125,8 +125,10 @@ const parseIGCSV = (text) => {
       caption: r['Caption'] || r['caption'] || '',
       media_type: (r['Media Type (Image, Video, Carousel)'] || r['Media Type'] || 'video').toLowerCase(),
       ig_url: r['Instagram Post'] || r['Post URL'] || r['URL'] || r['Permalink'] || '',
+      image_url: r['Image URL'] || r['Thumbnail'] || '',
       engagement_rate: parseFloat(engStr) || 0,
-      views: parseInt(r['Views'] || r['Impressions'] || r['Reach'] || r['views'] || r['reach'] || 0) || 0,
+      views: parseInt(r['Views'] || r['Impressions'] || r['views'] || 0) || 0,
+      reach: parseInt(r['Reach'] || r['reach'] || 0) || 0,
       likes: parseInt(r['Likes'] || r['likes'] || 0) || 0,
       saves: parseInt(r['Saves'] || r['saves'] || 0) || 0,
       shares: parseInt(r['Shares'] || r['shares'] || 0) || 0,
@@ -241,6 +243,7 @@ const NITMContentTracker = () => {
   const [sheetName, setSheetName] = useState('');
   const [sheetTab, setSheetTab] = useState(0);
   const [percentileMode, setPercentileMode] = useState(false);
+  const [popupPost, setPopupPost] = useState(null);
   const [showUpload, setShowUpload] = useState(false);
   const [uploadMsg, setUploadMsg] = useState('');
   const [revUnlocked, setRevUnlocked] = useState(false);
@@ -463,7 +466,7 @@ const NITMContentTracker = () => {
                 var idx = updated.findIndex(function(p) { return p.date + '|' + (p.caption||'').slice(0,30) === key; });
                 if (idx >= 0) {
                   // Update metrics on existing record, keep id and any manual overrides
-                  updated[idx] = {...updated[idx], views: np.views, likes: np.likes, comments: np.comments, saves: np.saves, shares: np.shares, eng_rate: np.eng_rate, reach: np.reach};
+                  updated[idx] = {...updated[idx], views: np.views, likes: np.likes, comments: np.comments, saves: np.saves, shares: np.shares, eng_rate: np.eng_rate, reach: np.reach, image_url: np.image_url || updated[idx].image_url};
                   updatedCount++;
                 } else {
                   maxId++;
@@ -1144,7 +1147,7 @@ const NITMContentTracker = () => {
                         const isReel = mt === 'video' || mt === 'reel';
                         const mediaColor = isReel ? '#f472b6' : '#38bdf8';
                         return (
-                        <div key={pi} style={{fontSize:'10px',padding:'3px 4px',marginBottom:'2px',borderRadius:'4px',background:scoreBg(eDisplay(p)),lineHeight:1.3,border:calMediaFilter==='both'?'1.5px solid '+mediaColor:'none'}}>
+                        <div key={pi} onClick={function(){setPopupPost(p);}} style={{fontSize:'10px',padding:'3px 4px',marginBottom:'2px',borderRadius:'4px',background:scoreBg(eDisplay(p)),lineHeight:1.3,border:calMediaFilter==='both'?'1.5px solid '+mediaColor:'none',cursor:'pointer'}}>
                           <div style={{display:'flex',gap:'3px',alignItems:'center',justifyContent:'space-between'}}>
                             <span style={{color:C.text,fontWeight:700,fontSize:'9px',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap',flex:1}}>{p.cls.content_type}</span>
                             <Badge p={p} />
@@ -1977,6 +1980,86 @@ const NITMContentTracker = () => {
         )}
 
       </div>
+
+      {/* Post Detail Popup */}
+      {popupPost && (() => {
+        var p = popupPost;
+        var eVal = eDisplay(p);
+        var lVal = p.lScore;
+        var ov = overrides[p.id] || {};
+        return (
+        <div onClick={function(){setPopupPost(null);}} style={{position:'fixed',top:0,left:0,right:0,bottom:0,background:'rgba(0,0,0,0.7)',zIndex:9999,display:'flex',alignItems:'center',justifyContent:'center',padding:'20px'}}>
+          <div onClick={function(e){e.stopPropagation();}} style={{background:C.card,borderRadius:'16px',border:'1px solid '+C.border,maxWidth:'520px',width:'100%',maxHeight:'90vh',overflowY:'auto',padding:'24px'}}>
+            {/* Header with close */}
+            <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',marginBottom:'16px'}}>
+              <div style={{flex:1}}>
+                <div style={{fontSize:'11px',color:C.muted}}>{p.date} · {(p.media_type||'').toLowerCase()==='video'||p.media_type==='reel'?'Reel':'Post'}</div>
+                <div style={{fontSize:'14px',fontWeight:700,color:C.text,marginTop:'4px'}}>{p.cls.content_type || 'No Type'}</div>
+              </div>
+              <button onClick={function(){setPopupPost(null);}} style={{background:'transparent',border:'none',color:C.muted,fontSize:'20px',cursor:'pointer',padding:'0 4px',lineHeight:1}}>×</button>
+            </div>
+
+            {/* Preview image */}
+            {p.image_url && (
+              <div style={{marginBottom:'16px',borderRadius:'10px',overflow:'hidden',background:C.bg}}>
+                <img src={p.image_url} style={{width:'100%',height:'auto',display:'block',maxHeight:'280px',objectFit:'cover'}} onError={function(e){e.target.style.display='none';}} />
+              </div>
+            )}
+
+            {/* Scores */}
+            <div style={{display:'flex',gap:'12px',marginBottom:'16px'}}>
+              <div style={{flex:1,background:scoreBg(eVal),borderRadius:'10px',padding:'14px',textAlign:'center'}}>
+                <div style={{fontSize:'28px',fontWeight:800,color:scoreColor(eVal),lineHeight:1}}>{eVal}</div>
+                <div style={{fontSize:'11px',color:C.dim,marginTop:'4px'}}>E-Score{percentileMode?' (pctl)':''}</div>
+              </div>
+              <div style={{flex:1,background:lScoreBg(lVal),borderRadius:'10px',padding:'14px',textAlign:'center'}}>
+                <div style={{fontSize:'28px',fontWeight:800,color:lScoreColor(lVal),lineHeight:1}}>{lVal}</div>
+                <div style={{fontSize:'11px',color:C.dim,marginTop:'4px'}}>L-Score</div>
+              </div>
+              {p.cls.intent && (
+              <div style={{flex:1,background:intentC[p.cls.intent]+'15',borderRadius:'10px',padding:'14px',textAlign:'center'}}>
+                <div style={{fontSize:'20px',fontWeight:800,color:intentC[p.cls.intent],lineHeight:1,textTransform:'capitalize'}}>{p.cls.intent}</div>
+                <div style={{fontSize:'11px',color:C.dim,marginTop:'4px'}}>Intent</div>
+              </div>
+              )}
+            </div>
+
+            {/* Metrics grid */}
+            <div style={{display:'grid',gridTemplateColumns:'repeat(3,1fr)',gap:'8px',marginBottom:'16px'}}>
+              {[
+                {label:'Views',val:p.views},
+                {label:'Likes',val:p.likes},
+                {label:'Saves',val:p.saves},
+                {label:'Shares',val:p.shares},
+                {label:'Comments',val:p.comments},
+                {label:'Eng Rate',val:p.engagement_rate?p.engagement_rate.toFixed(2)+'%':'—'},
+                {label:'Reach',val:p.reach||'—'},
+                {label:'LT Clicks',val:p.ltClicks||'—'},
+              ].map(function(m){return (
+                <div key={m.label} style={{background:C.bg,borderRadius:'8px',padding:'10px',textAlign:'center'}}>
+                  <div style={{fontSize:'16px',fontWeight:700,color:C.text}}>{typeof m.val==='number'?m.val.toLocaleString():m.val}</div>
+                  <div style={{fontSize:'10px',color:C.muted,marginTop:'2px'}}>{m.label}</div>
+                </div>
+              );})}
+            </div>
+
+            {/* Caption */}
+            <div style={{background:C.bg,borderRadius:'8px',padding:'12px',fontSize:'12px',color:C.dim,lineHeight:1.6,marginBottom:'16px',maxHeight:'120px',overflowY:'auto'}}>{p.caption}</div>
+
+            {/* Last updated */}
+            {ov.lastEdited && (
+              <div style={{fontSize:'10px',color:C.muted,marginBottom:'12px'}}>Last edited: {new Date(ov.lastEdited).toLocaleString()}</div>
+            )}
+
+            {/* Links */}
+            <div style={{display:'flex',gap:'8px'}}>
+              <a href={p.ig_url} target="_blank" rel="noopener noreferrer" style={{flex:1,padding:'8px',borderRadius:'8px',background:'#e1306c18',color:'#e1306c',textDecoration:'none',textAlign:'center',fontSize:'12px',fontWeight:600}}>View on Instagram</a>
+              <a href={getCUUrl(p)} target="_blank" rel="noopener noreferrer" style={{flex:1,padding:'8px',borderRadius:'8px',background:C.purple+'18',color:C.purple,textDecoration:'none',textAlign:'center',fontSize:'12px',fontWeight:600}}>View in ClickUp</a>
+            </div>
+          </div>
+        </div>
+        );
+      })()}
     </div>
   );
 }
