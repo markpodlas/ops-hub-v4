@@ -1608,6 +1608,56 @@ async function handleCxAgentAPI(request, env, path) {
       return new Response(JSON.stringify({ updated: true }), { headers: cors });
     }
 
+    // GET /cx-agent/api/diag/channels
+    // Hits Zendesk search API and returns ticket count grouped by channel for last 7 days.
+    // Useful to verify whether Messaging/Instagram tickets are actually hitting the ticket queue.
+    if (path === '/cx-agent/api/diag/channels' && request.method === 'GET') {
+      const subdomain = await cxGetConfig(db, 'zendesk_subdomain');
+      const auth = btoa(`${env.ZENDESK_EMAIL}/token:${env.ZENDESK_API_TOKEN}`);
+      const cutoff = new Date(Date.now() - 7 * 86400 * 1000).toISOString().slice(0, 10);
+      try {
+        const resp = await fetch(
+          `https://${subdomain}.zendesk.com/api/v2/search.json?query=${encodeURIComponent('type:ticket created>' + cutoff)}&per_page=100`,
+          { headers: { Authorization: `Basic ${auth}` } }
+        );
+        if (!resp.ok) {
+          return new Response(JSON.stringify({ error: `Zendesk API ${resp.status}`, body: await resp.text() }), { status: 500, headers: cors });
+        }
+        const data = await resp.json();
+        const results = data.results || [];
+        const byChannel = {};
+        const bySource = {};
+        const samples = {};
+        for (const t of results) {
+          const ch = t.via?.channel || 'unknown';
+          const src = t.via?.source?.rel || t.via?.source?.from?.name || '—';
+          byChannel[ch] = (byChannel[ch] || 0) + 1;
+          bySource[`${ch} / ${src}`] = (bySource[`${ch} / ${src}`] || 0) + 1;
+          if (!samples[ch]) samples[ch] = [];
+          if (samples[ch].length < 3) {
+            samples[ch].push({
+              id: t.id,
+              subject: t.subject,
+              requester_email: t.via?.source?.from?.address,
+              requester_name: t.via?.source?.from?.name,
+              description_preview: (t.description || '').substring(0, 200),
+              created_at: t.created_at
+            });
+          }
+        }
+        return new Response(JSON.stringify({
+          total_tickets: results.length,
+          cutoff_date: cutoff,
+          by_channel: byChannel,
+          by_channel_and_source: bySource,
+          sample_tickets: samples,
+          note: 'Total is capped at 100 per Zendesk Search API call. Use this to verify which channels are creating tickets.'
+        }, null, 2), { headers: { ...cors, 'Content-Type': 'application/json' } });
+      } catch (err) {
+        return new Response(JSON.stringify({ error: err.message }), { status: 500, headers: cors });
+      }
+    }
+
     // GET /cx-agent/api/export?start=YYYY-MM-DD&end=YYYY-MM-DD&format=csv
     // Exports tickets + their decision trace + draft responses as CSV for analysis.
     if (path === '/cx-agent/api/export' && request.method === 'GET') {
@@ -1638,14 +1688,20 @@ async function handleCxAgentAPI(request, env, path) {
 
       const ticketIds = tickets.map(t => t.id);
 
-      // Batch fetch all decisions and responses for these tickets
-      // D1 has limits on bind params, so chunk if needed (but we're usually fine under 100 tickets)
-      const placeholders = ticketIds.map(() => '?').join(',');
-      const decisionsResult = await db.prepare(`SELECT * FROM agent_decisions WHERE ticket_id IN (${placeholders}) ORDER BY ticket_id, step_order`).bind(...ticketIds).all();
-      const responsesResult = await db.prepare(`SELECT * FROM agent_responses WHERE ticket_id IN (${placeholders}) ORDER BY ticket_id, created_at`).bind(...ticketIds).all();
-
-      const decisions = decisionsResult.results || [];
-      const responses = responsesResult.results || [];
+      // Chunked fetch: D1 caps bind variables at ~100 per query, so we batch.
+      // Without chunking, exports of more than ~100 tickets fail with
+      // "D1_ERROR: too many SQL variables".
+      const CHUNK = 90; // safely under D1's limit
+      const decisions = [];
+      const responses = [];
+      for (let i = 0; i < ticketIds.length; i += CHUNK) {
+        const chunk = ticketIds.slice(i, i + CHUNK);
+        const placeholders = chunk.map(() => '?').join(',');
+        const dRes = await db.prepare(`SELECT * FROM agent_decisions WHERE ticket_id IN (${placeholders}) ORDER BY ticket_id, step_order`).bind(...chunk).all();
+        const rRes = await db.prepare(`SELECT * FROM agent_responses WHERE ticket_id IN (${placeholders}) ORDER BY ticket_id, created_at`).bind(...chunk).all();
+        if (dRes.results) decisions.push(...dRes.results);
+        if (rRes.results) responses.push(...rRes.results);
+      }
 
       // Group by ticket_id
       const decisionsByTicket = {};
