@@ -441,6 +441,24 @@ async function initCxAgentTables(db) {
       body TEXT NOT NULL, variables TEXT, is_active INTEGER DEFAULT 1,
       created_at TEXT DEFAULT (datetime('now')), updated_at TEXT DEFAULT (datetime('now'))
     )`),
+    db.prepare(`CREATE TABLE IF NOT EXISTS agent_human_replies (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ticket_id INTEGER NOT NULL,
+      zendesk_ticket_id TEXT NOT NULL,
+      zendesk_comment_id TEXT,
+      author_id TEXT,
+      author_name TEXT,
+      body TEXT,
+      reply_created_at TEXT,
+      captured_at TEXT DEFAULT (datetime('now')),
+      source TEXT DEFAULT 'auto',
+      rating TEXT,
+      rating_note TEXT,
+      rated_by TEXT,
+      rated_at TEXT
+    )`),
+    db.prepare(`CREATE INDEX IF NOT EXISTS idx_human_replies_ticket ON agent_human_replies(ticket_id)`),
+    db.prepare(`CREATE INDEX IF NOT EXISTS idx_human_replies_comment ON agent_human_replies(zendesk_comment_id)`),
   ]);
 
   const existing = await db.prepare("SELECT COUNT(*) as c FROM agent_config").first();
@@ -568,6 +586,99 @@ async function handleCxAgentWebhook(request, env, ctx) {
   const ticketId = insertResult.meta.last_row_id;
   ctx.waitUntil(runCxAgentPipeline(ticketId, ticketData, db, env));
   return new Response(JSON.stringify({ accepted: true, ticket_id: ticketId, zendesk_ticket_id: zendeskTicketId }), { headers: cors });
+}
+
+// ============================================================================
+// v4.5: HUMAN REPLY CAPTURE WEBHOOK
+// ============================================================================
+// Fires when a public team reply is added to an agent-processed ticket.
+// Captures the reply for training comparison against the agent's draft.
+async function handleCxAgentReplyWebhook(request, env, ctx) {
+  const cors = { "Access-Control-Allow-Origin": "*", "Content-Type": "application/json" };
+  if (request.method === "OPTIONS") return new Response(null, { headers: cors });
+  if (!env.CX_AGENT_DB) return new Response(JSON.stringify({ error: "CX_AGENT_DB not configured" }), { status: 500, headers: cors });
+
+  const db = env.CX_AGENT_DB;
+  await initCxAgentTables(db);
+
+  const rawBody = await request.text();
+  if (env.ZENDESK_WEBHOOK_SECRET) {
+    const sigHeader = request.headers.get('x-zendesk-webhook-signature');
+    const tsHeader = request.headers.get('x-zendesk-webhook-signature-timestamp');
+    if (sigHeader && tsHeader) {
+      const valid = await verifyZendeskSignature(rawBody, tsHeader, sigHeader, env.ZENDESK_WEBHOOK_SECRET);
+      if (!valid) return new Response(JSON.stringify({ error: "Invalid signature" }), { status: 401, headers: cors });
+    }
+  }
+
+  let payload;
+  try { payload = JSON.parse(rawBody); } catch { return new Response(JSON.stringify({ error: "Invalid JSON" }), { status: 400, headers: cors }); }
+
+  const zendeskTicketId = payload.ticket_id || payload.body?.ticket_id;
+  if (!zendeskTicketId) return new Response(JSON.stringify({ error: "Missing ticket_id" }), { status: 400, headers: cors });
+
+  // Only capture for tickets we've processed
+  const ticket = await db.prepare("SELECT id, classified_intent FROM agent_tickets WHERE zendesk_ticket_id = ?").bind(String(zendeskTicketId)).first();
+  if (!ticket) return new Response(JSON.stringify({ skipped: true, reason: "Ticket not in agent DB" }), { headers: cors });
+
+  // Run capture in background so we ack the webhook fast
+  ctx.waitUntil(captureHumanReply(ticket.id, String(zendeskTicketId), db, env));
+  return new Response(JSON.stringify({ accepted: true, ticket_id: ticket.id }), { headers: cors });
+}
+
+async function captureHumanReply(agentTicketId, zendeskTicketId, db, env) {
+  try {
+    const subdomain = await cxGetConfig(db, 'zendesk_subdomain');
+    const supportStaffIds = await cxGetConfig(db, 'support_staff_ids');
+    const auth = btoa(`${env.ZENDESK_EMAIL}/token:${env.ZENDESK_API_TOKEN}`);
+    const resp = await fetch(`https://${subdomain}.zendesk.com/api/v2/tickets/${zendeskTicketId}/comments.json`, {
+      headers: { Authorization: `Basic ${auth}` }
+    });
+    if (!resp.ok) return;
+    const { comments = [] } = await resp.json();
+
+    // Build set of comments we've already captured for this ticket so we don't duplicate
+    const existing = await db.prepare("SELECT zendesk_comment_id FROM agent_human_replies WHERE ticket_id = ?").bind(agentTicketId).all();
+    const existingIds = new Set((existing.results || []).map(r => r.zendesk_comment_id).filter(Boolean));
+
+    // Find the most recent public reply from a team member that we haven't captured yet
+    // Reverse so newest first
+    const candidates = comments
+      .filter(c => c.public === true)                          // public, not internal note
+      .filter(c => supportStaffIds.includes(c.author_id))       // from team, not customer
+      .filter(c => !existingIds.has(String(c.id)))              // not already captured
+      .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+
+    if (candidates.length === 0) return;
+    const reply = candidates[0];
+
+    // Pull author name (best-effort)
+    let authorName = null;
+    try {
+      const userResp = await fetch(`https://${subdomain}.zendesk.com/api/v2/users/${reply.author_id}.json`, {
+        headers: { Authorization: `Basic ${auth}` }
+      });
+      if (userResp.ok) {
+        const { user } = await userResp.json();
+        authorName = user?.name ?? null;
+      }
+    } catch {}
+
+    await db.prepare(`
+      INSERT INTO agent_human_replies (ticket_id, zendesk_ticket_id, zendesk_comment_id, author_id, author_name, body, reply_created_at, source)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 'auto')
+    `).bind(
+      agentTicketId,
+      zendeskTicketId,
+      String(reply.id),
+      String(reply.author_id),
+      authorName,
+      reply.plain_body || reply.body || '',
+      reply.created_at
+    ).run();
+  } catch (err) {
+    console.error('captureHumanReply error:', err);
+  }
 }
 
 async function runCxAgentPipeline(ticketId, ticketData, db, env) {
@@ -1664,6 +1775,133 @@ async function handleCxAgentAPI(request, env, path) {
       return new Response(JSON.stringify({ updated: true }), { headers: cors });
     }
 
+    // ==========================================================================
+    // v4.5: TRAINING REVIEW APIs
+    // ==========================================================================
+
+    // GET /cx-agent/api/training/list?limit=50&filter=needs_review|all|rated
+    // Returns tickets that have a draft AND a captured human reply, joined with rating.
+    if (path === '/cx-agent/api/training/list' && request.method === 'GET') {
+      const limit = Math.min(parseInt(url.searchParams.get('limit') || '50'), 200);
+      const filter = url.searchParams.get('filter') || 'needs_review';
+      const intent = url.searchParams.get('intent') || null;
+
+      let where = `t.status IN ('drafted','escalated') AND r.id IS NOT NULL AND hr.id IS NOT NULL`;
+      if (filter === 'needs_review') where += ` AND hr.rating IS NULL`;
+      if (filter === 'rated') where += ` AND hr.rating IS NOT NULL`;
+      if (intent) where += ` AND t.classified_intent = ?`;
+
+      const stmt = db.prepare(`
+        SELECT
+          t.id as ticket_id, t.zendesk_ticket_id, t.subject, t.customer_email, t.channel,
+          t.classified_intent, t.intent_confidence, t.final_action, t.received_at,
+          r.draft_body as agent_draft, r.response_confidence as draft_confidence,
+          hr.id as reply_id, hr.body as human_reply, hr.author_name, hr.reply_created_at,
+          hr.rating, hr.rating_note, hr.rated_by, hr.rated_at
+        FROM agent_tickets t
+        LEFT JOIN (
+          SELECT ticket_id, draft_body, response_confidence, MAX(created_at) as latest
+          FROM agent_responses GROUP BY ticket_id
+        ) r ON r.ticket_id = t.id
+        LEFT JOIN (
+          SELECT ticket_id, id, body, author_name, reply_created_at, rating, rating_note, rated_by, rated_at,
+                 MAX(reply_created_at) as latest
+          FROM agent_human_replies GROUP BY ticket_id
+        ) hr ON hr.ticket_id = t.id
+        WHERE ${where}
+        ORDER BY t.received_at DESC
+        LIMIT ?
+      `);
+      const params = intent ? [intent, limit] : [limit];
+      const result = await stmt.bind(...params).all();
+      return new Response(JSON.stringify({ tickets: result.results || [] }), { headers: cors });
+    }
+
+    // POST /cx-agent/api/training/rate
+    // Body: { reply_id, rating: 'good'|'minor'|'rewrite'|'flag', rating_note?, rated_by? }
+    if (path === '/cx-agent/api/training/rate' && request.method === 'POST') {
+      const body = await request.json();
+      if (!body.reply_id || !body.rating) {
+        return new Response(JSON.stringify({ error: 'reply_id and rating required' }), { status: 400, headers: cors });
+      }
+      const allowed = ['good', 'minor', 'rewrite', 'flag', null];
+      if (!allowed.includes(body.rating)) {
+        return new Response(JSON.stringify({ error: 'invalid rating' }), { status: 400, headers: cors });
+      }
+      await db.prepare(`
+        UPDATE agent_human_replies
+        SET rating = ?, rating_note = ?, rated_by = ?, rated_at = datetime('now')
+        WHERE id = ?
+      `).bind(body.rating, body.rating_note ?? null, body.rated_by ?? 'unknown', parseInt(body.reply_id)).run();
+      return new Response(JSON.stringify({ updated: true }), { headers: cors });
+    }
+
+    // POST /cx-agent/api/training/manual-reply
+    // Body: { ticket_id (agent ticket id), body, author_name? }
+    // Used when auto-capture grabbed the wrong comment or didn't fire.
+    if (path === '/cx-agent/api/training/manual-reply' && request.method === 'POST') {
+      const body = await request.json();
+      if (!body.ticket_id || !body.body) {
+        return new Response(JSON.stringify({ error: 'ticket_id and body required' }), { status: 400, headers: cors });
+      }
+      const ticket = await db.prepare("SELECT zendesk_ticket_id FROM agent_tickets WHERE id = ?").bind(parseInt(body.ticket_id)).first();
+      if (!ticket) return new Response(JSON.stringify({ error: 'ticket not found' }), { status: 404, headers: cors });
+
+      await db.prepare(`
+        INSERT INTO agent_human_replies (ticket_id, zendesk_ticket_id, body, author_name, reply_created_at, source)
+        VALUES (?, ?, ?, ?, datetime('now'), 'manual')
+      `).bind(parseInt(body.ticket_id), ticket.zendesk_ticket_id, body.body, body.author_name ?? null).run();
+      return new Response(JSON.stringify({ saved: true }), { headers: cors });
+    }
+
+    // POST /cx-agent/api/training/capture-now
+    // Body: { ticket_id (agent ticket id) }
+    // Manually trigger the capture for a ticket — useful for backfilling existing tickets.
+    if (path === '/cx-agent/api/training/capture-now' && request.method === 'POST') {
+      const body = await request.json();
+      if (!body.ticket_id) return new Response(JSON.stringify({ error: 'ticket_id required' }), { status: 400, headers: cors });
+      const ticket = await db.prepare("SELECT id, zendesk_ticket_id FROM agent_tickets WHERE id = ?").bind(parseInt(body.ticket_id)).first();
+      if (!ticket) return new Response(JSON.stringify({ error: 'ticket not found' }), { status: 404, headers: cors });
+      await captureHumanReply(ticket.id, ticket.zendesk_ticket_id, db, env);
+      return new Response(JSON.stringify({ captured: true }), { headers: cors });
+    }
+
+    // GET /cx-agent/api/training/insights
+    // Aggregate stats: rating distribution, by intent, by action, time saved estimate.
+    if (path === '/cx-agent/api/training/insights' && request.method === 'GET') {
+      const totalReplies = await db.prepare("SELECT COUNT(*) as c FROM agent_human_replies").first();
+      const ratedReplies = await db.prepare("SELECT COUNT(*) as c FROM agent_human_replies WHERE rating IS NOT NULL").first();
+      const ratingDist = await db.prepare("SELECT rating, COUNT(*) as n FROM agent_human_replies WHERE rating IS NOT NULL GROUP BY rating").all();
+      const byIntent = await db.prepare(`
+        SELECT t.classified_intent, hr.rating, COUNT(*) as n
+        FROM agent_human_replies hr
+        JOIN agent_tickets t ON t.id = hr.ticket_id
+        WHERE hr.rating IS NOT NULL
+        GROUP BY t.classified_intent, hr.rating
+      `).all();
+      const flags = await db.prepare(`
+        SELECT t.zendesk_ticket_id, t.classified_intent, hr.rating_note, hr.rated_at
+        FROM agent_human_replies hr
+        JOIN agent_tickets t ON t.id = hr.ticket_id
+        WHERE hr.rating = 'flag'
+        ORDER BY hr.rated_at DESC LIMIT 20
+      `).all();
+
+      // Estimate time saved: 'good' = 3 min, 'minor' = 1 min, 'rewrite' = 0, 'flag' = 0
+      const TIME = { good: 3, minor: 1, rewrite: 0, flag: 0 };
+      let timeSavedMin = 0;
+      for (const r of ratingDist.results || []) timeSavedMin += (TIME[r.rating] || 0) * r.n;
+
+      return new Response(JSON.stringify({
+        total_replies_captured: totalReplies.c,
+        total_rated: ratedReplies.c,
+        rating_distribution: ratingDist.results || [],
+        by_intent: byIntent.results || [],
+        recent_flags: flags.results || [],
+        estimated_time_saved_minutes: timeSavedMin
+      }, null, 2), { headers: cors });
+    }
+
     // GET /cx-agent/api/diag/channels
     // Hits Zendesk search API and returns ticket count grouped by channel for last 7 days.
     // Useful to verify whether Messaging/Instagram tickets are actually hitting the ticket queue.
@@ -1868,6 +2106,7 @@ export default {
     if (request.method === "OPTIONS") { return new Response(null, { headers: { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS", "Access-Control-Allow-Headers": "Content-Type" } }); }
     // ===== CX AGENT =====
     if (path === "/cx-agent/webhook/zendesk") { return handleCxAgentWebhook(request, env, ctx); }
+    if (path === "/cx-agent/webhook/zendesk-reply") { return handleCxAgentReplyWebhook(request, env, ctx); }
     if (path.startsWith("/cx-agent/api/")) { return handleCxAgentAPI(request, env, path); }
     // ===== CONTENT TRACKER API (D1-backed) =====
     if (path === "/tracker/api/data") { return handleTrackerAPI(request, env); }

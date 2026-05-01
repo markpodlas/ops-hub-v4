@@ -148,6 +148,7 @@
 
 <div class="tabs">
   <button class="tab active" data-tab="tickets">Activity Feed</button>
+  <button class="tab" data-tab="training">Training Review</button>
   <button class="tab" data-tab="config">Configuration</button>
   <button class="tab" data-tab="templates">Response Templates</button>
 </div>
@@ -205,6 +206,31 @@
   </div>
 </div>
 
+<!-- TRAINING REVIEW TAB -->
+<div class="tab-panel" id="tab-training">
+  <div class="kpi-row" id="training-insights">
+    <div class="loading">Loading insights...</div>
+  </div>
+
+  <div class="filter-bar">
+    <label>Filter:</label>
+    <select id="training-filter">
+      <option value="needs_review">Needs review</option>
+      <option value="rated">Rated</option>
+      <option value="all">All</option>
+    </select>
+    <label>Intent:</label>
+    <select id="training-intent">
+      <option value="">All</option>
+    </select>
+    <button class="save-btn" style="padding:6px 14px;background:var(--accent);color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:13px;" onclick="loadTraining()">Refresh</button>
+  </div>
+
+  <div id="training-list">
+    <div class="loading">Loading tickets...</div>
+  </div>
+</div>
+
 <!-- CONFIG TAB -->
 <div class="tab-panel" id="tab-config">
   <div id="config-list">
@@ -254,6 +280,7 @@ document.querySelectorAll('.tab').forEach(tab => {
     if (tab.dataset.tab === 'config') loadConfig();
     if (tab.dataset.tab === 'templates') loadTemplates();
     if (tab.dataset.tab === 'tickets') { loadStats(); loadTickets(); }
+    if (tab.dataset.tab === 'training') { loadTrainingInsights(); loadTraining(); }
   });
 });
 
@@ -569,6 +596,139 @@ async function exportCsv() {
   document.getElementById('export-end').value = fmt(end);
   document.getElementById('export-start').value = fmt(start);
 })();
+
+// ============ TRAINING REVIEW ============
+
+async function loadTrainingInsights() {
+  try {
+    const data = await api('/training/insights');
+    const dist = {};
+    for (const r of data.rating_distribution || []) dist[r.rating] = r.n;
+    const good = dist.good || 0;
+    const minor = dist.minor || 0;
+    const rewrite = dist.rewrite || 0;
+    const flag = dist.flag || 0;
+    const total = good + minor + rewrite + flag;
+    const accuracyPct = total > 0 ? Math.round(((good + minor) / total) * 100) : 0;
+    const hours = Math.round((data.estimated_time_saved_minutes || 0) / 60 * 10) / 10;
+
+    document.getElementById('training-insights').innerHTML = `
+      <div class="kpi-card"><div class="label">Replies Captured</div><div class="value">${data.total_replies_captured || 0}</div></div>
+      <div class="kpi-card"><div class="label">Rated</div><div class="value">${data.total_rated || 0}</div></div>
+      <div class="kpi-card"><div class="label">Agent Accuracy</div><div class="value">${accuracyPct}%</div><div class="sub">good or minor edits</div></div>
+      <div class="kpi-card"><div class="label">👍 Good</div><div class="value">${good}</div></div>
+      <div class="kpi-card"><div class="label">✏️ Minor edits</div><div class="value">${minor}</div></div>
+      <div class="kpi-card"><div class="label">❌ Rewrote</div><div class="value">${rewrite}</div></div>
+      <div class="kpi-card"><div class="label">🚩 Flagged</div><div class="value">${flag}</div></div>
+      <div class="kpi-card"><div class="label">Time Saved</div><div class="value">~${hours}h</div><div class="sub">cumulative estimate</div></div>
+    `;
+  } catch (e) {
+    document.getElementById('training-insights').innerHTML = '<div class="loading">Could not load insights: ' + escape(e.message) + '</div>';
+  }
+}
+
+async function loadTraining() {
+  const filter = document.getElementById('training-filter').value;
+  const intent = document.getElementById('training-intent').value;
+  const container = document.getElementById('training-list');
+  container.innerHTML = '<div class="loading">Loading tickets...</div>';
+  try {
+    const params = new URLSearchParams({ limit: '50', filter });
+    if (intent) params.set('intent', intent);
+    const data = await api('/training/list?' + params.toString());
+    const tickets = data.tickets || [];
+
+    if (tickets.length === 0) {
+      container.innerHTML = '<div class="loading" style="padding:40px;text-align:center">No tickets match this filter yet. Captured replies will appear once Amanda or the team replies on agent-processed tickets.</div>';
+      return;
+    }
+
+    container.innerHTML = tickets.map(t => renderTrainingCard(t)).join('');
+  } catch (e) {
+    container.innerHTML = '<div class="loading">Could not load: ' + escape(e.message) + '</div>';
+  }
+}
+
+function renderTrainingCard(t) {
+  const ratingPill = t.rating ? `<span class="pill ${ratingClass(t.rating)}" style="font-size:11px">${ratingLabel(t.rating)}</span>` : '<span class="pill pill-neutral" style="font-size:11px">unrated</span>';
+  const intentPill = t.classified_intent ? `<span class="pill pill-info mono">${t.classified_intent}</span>` : '';
+  return `
+    <div class="card" style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:16px;margin-bottom:12px">
+      <div style="display:flex;justify-content:space-between;align-items:start;margin-bottom:10px">
+        <div>
+          <div style="font-weight:500;font-size:14px">#${t.zendesk_ticket_id} · ${escape(t.subject || '(no subject)').substring(0, 80)}</div>
+          <div style="color:var(--text-muted);font-size:12px;margin-top:4px">
+            ${escape(t.customer_email || '—')} · ${formatDate(t.received_at)} · ${intentPill} · ${Math.round((t.intent_confidence||0)*100)}%
+          </div>
+        </div>
+        <div>${ratingPill}</div>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:12px">
+        <div>
+          <div style="font-size:11px;color:var(--text-muted);margin-bottom:6px;text-transform:uppercase;letter-spacing:0.5px">🤖 Agent Draft</div>
+          <div style="background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:10px;font-size:13px;white-space:pre-wrap;max-height:280px;overflow-y:auto">${escape((t.agent_draft || '(no draft — escalated or not generated)').substring(0, 4000))}</div>
+        </div>
+        <div>
+          <div style="font-size:11px;color:var(--text-muted);margin-bottom:6px;text-transform:uppercase;letter-spacing:0.5px">👤 Actual Reply ${t.author_name ? `· ${escape(t.author_name)}` : ''}</div>
+          <div style="background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:10px;font-size:13px;white-space:pre-wrap;max-height:280px;overflow-y:auto">${escape((t.human_reply || '(not captured yet)').substring(0, 4000))}</div>
+        </div>
+      </div>
+      <div style="display:flex;gap:6px;margin-top:14px;align-items:center;flex-wrap:wrap">
+        <span style="font-size:12px;color:var(--text-muted);margin-right:4px">Rate:</span>
+        <button onclick="rateReply(${t.reply_id}, 'good')" class="rate-btn ${t.rating==='good'?'active':''}" data-rating="good">👍 Good</button>
+        <button onclick="rateReply(${t.reply_id}, 'minor')" class="rate-btn ${t.rating==='minor'?'active':''}" data-rating="minor">✏️ Minor edits</button>
+        <button onclick="rateReply(${t.reply_id}, 'rewrite')" class="rate-btn ${t.rating==='rewrite'?'active':''}" data-rating="rewrite">❌ Rewrote</button>
+        <button onclick="rateReply(${t.reply_id}, 'flag')" class="rate-btn ${t.rating==='flag'?'active':''}" data-rating="flag">🚩 Flag</button>
+        <button onclick="addNote(${t.reply_id}, ${JSON.stringify(t.rating_note || '').replace(/"/g, '&quot;')})" style="font-size:12px;padding:4px 10px;background:transparent;border:1px solid var(--border);color:var(--text-muted);border-radius:4px;cursor:pointer;margin-left:auto">📝 ${t.rating_note ? 'Edit note' : 'Add note'}</button>
+      </div>
+      ${t.rating_note ? `<div style="margin-top:8px;padding:8px 10px;background:var(--surface2);border-radius:4px;font-size:12px;color:var(--text-muted);font-style:italic">"${escape(t.rating_note)}"</div>` : ''}
+    </div>
+  `;
+}
+
+function ratingLabel(r) {
+  return ({good:'👍 Good', minor:'✏️ Minor edits', rewrite:'❌ Rewrote', flag:'🚩 Flagged'})[r] || r;
+}
+function ratingClass(r) {
+  return ({good:'pill-success', minor:'pill-info', rewrite:'pill-warn', flag:'pill-error'})[r] || 'pill-neutral';
+}
+
+async function rateReply(replyId, rating) {
+  try {
+    await api('/training/rate', { method: 'POST', body: JSON.stringify({ reply_id: replyId, rating }) });
+    toast('Rating saved', 'success');
+    loadTraining();
+    loadTrainingInsights();
+  } catch (e) { toast('Failed: ' + e.message, 'error'); }
+}
+
+async function addNote(replyId, currentNote) {
+  const note = prompt('Add a note about this reply (e.g., "I changed it because we offer free shipping over $50"):', currentNote || '');
+  if (note === null) return;
+  try {
+    // Need the existing rating to send it back along with the note
+    const tickets = (await api('/training/list?filter=all&limit=200')).tickets || [];
+    const t = tickets.find(x => x.reply_id === replyId);
+    if (!t) { toast('Could not find ticket', 'error'); return; }
+    await api('/training/rate', { method: 'POST', body: JSON.stringify({ reply_id: replyId, rating: t.rating || 'flag', rating_note: note }) });
+    toast('Note saved', 'success');
+    loadTraining();
+  } catch (e) { toast('Failed: ' + e.message, 'error'); }
+}
+
+// Style for rate buttons (inject once at script load)
+(function injectRateButtonStyle(){
+  const style = document.createElement('style');
+  style.textContent = `
+    .rate-btn { font-size: 12px; padding: 4px 10px; background: transparent; border: 1px solid var(--border); color: var(--text); border-radius: 4px; cursor: pointer; transition: all 0.15s; }
+    .rate-btn:hover { background: var(--surface2); }
+    .rate-btn.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+  `;
+  document.head.appendChild(style);
+})();
+
+document.getElementById('training-filter').addEventListener('change', loadTraining);
+document.getElementById('training-intent').addEventListener('change', loadTraining);
 
 // Initial load
 loadStats();
