@@ -459,7 +459,7 @@ async function initCxAgentTables(db) {
       db.prepare("INSERT INTO agent_config (key, value, value_type, description) VALUES (?, ?, ?, ?)").bind('support_staff_ids', '[29324864593179,16129176780315,32863955019931,14117981153307]', 'json', 'Zendesk support staff IDs'),
       db.prepare("INSERT INTO agent_config (key, value, value_type, description) VALUES (?, ?, ?, ?)").bind('max_order_age_days', '90', 'number', 'Max age (days) of orders the agent will auto-respond about'),
       db.prepare("INSERT INTO agent_config (key, value, value_type, description) VALUES (?, ?, ?, ?)").bind('require_email_match', 'true', 'boolean', 'If true, require Zendesk email matches Shopify order email (unless order number in ticket)'),
-      db.prepare("INSERT INTO agent_config (key, value, value_type, description) VALUES (?, ?, ?, ?)").bind('suggested_intents', '["product_info","shipping_delivery","education_content","order_general","returns_damaged","billing_payment","account","refund_cancel"]', 'json', 'Intents where agent drafts AI suggestions (vs specialized handler)'),
+      db.prepare("INSERT INTO agent_config (key, value, value_type, description) VALUES (?, ?, ?, ?)").bind('suggested_intents', '["product_info","shipping_delivery","education_content","order_general","returns_damaged","billing_payment","account","refund_cancel","social_engagement"]', 'json', 'Intents where agent drafts AI suggestions (vs specialized handler)'),
       db.prepare("INSERT INTO agent_config (key, value, value_type, description) VALUES (?, ?, ?, ?)").bind('noise_suggestion_enabled', 'true', 'boolean', 'For noise-classified tickets, post a close-recommendation note'),
       db.prepare("INSERT INTO agent_config (key, value, value_type, description) VALUES (?, ?, ?, ?)").bind('help_center_enabled', 'true', 'boolean', 'Query Zendesk Help Center for article context when drafting suggestions'),
       db.prepare("INSERT INTO agent_config (key, value, value_type, description) VALUES (?, ?, ?, ?)").bind('help_center_max_articles', '3', 'number', 'Max articles to include as context per suggestion'),
@@ -470,7 +470,7 @@ async function initCxAgentTables(db) {
   // v4.4 migration: add new config keys if they don't already exist
   // (the block above only runs on empty DB; this catches existing deployments)
   const v44Keys = [
-    ['suggested_intents', '["product_info","shipping_delivery","education_content","order_general","returns_damaged","billing_payment","account","refund_cancel"]', 'json', 'Intents where agent drafts AI suggestions (vs specialized handler)'],
+    ['suggested_intents', '["product_info","shipping_delivery","education_content","order_general","returns_damaged","billing_payment","account","refund_cancel","social_engagement"]', 'json', 'Intents where agent drafts AI suggestions (vs specialized handler)'],
     ['noise_suggestion_enabled', 'true', 'boolean', 'For noise-classified tickets, post a close-recommendation note'],
     ['help_center_enabled', 'true', 'boolean', 'Query Zendesk Help Center for article context when drafting suggestions'],
     ['help_center_max_articles', '3', 'number', 'Max articles to include as context per suggestion'],
@@ -484,6 +484,19 @@ async function initCxAgentTables(db) {
       await db.prepare("INSERT INTO agent_config (key, value, value_type, description) VALUES (?, ?, ?, ?)").bind(key, value, value_type, description).run();
     }
   }
+
+  // v4.4.4 migration: ensure social_engagement is in suggested_intents
+  // (upgrade from earlier v4.4.x deployments where it wasn't yet included)
+  try {
+    const row = await db.prepare("SELECT value FROM agent_config WHERE key = 'suggested_intents'").first();
+    if (row?.value) {
+      const arr = JSON.parse(row.value);
+      if (Array.isArray(arr) && !arr.includes('social_engagement')) {
+        arr.push('social_engagement');
+        await db.prepare("UPDATE agent_config SET value = ?, updated_at = datetime('now') WHERE key = 'suggested_intents'").bind(JSON.stringify(arr)).run();
+      }
+    }
+  } catch {}
 
   const existingTpl = await db.prepare("SELECT COUNT(*) as c FROM agent_templates").first();
   if (existingTpl.c === 0) {
@@ -1211,6 +1224,15 @@ Return ONLY the reply body. No subject line, no JSON, no commentary.`;
     const channelLabel = ticketData.isMessagingChannel
       ? `${ticketData.channel} (social DM — keep reply short and casual)`
       : (ticketData.channel || 'email');
+
+    // Some intents need special framing in the prompt
+    let intentGuidance = '';
+    if (intent.intent === 'social_engagement') {
+      intentGuidance = `\n\nNote on intent: 'social_engagement' means the customer is being kind, sharing a positive experience, expressing gratitude, or just engaging with the brand — they are NOT asking for help. Your reply should be a SHORT warm acknowledgment (1-3 sentences max). Do not over-explain, do not link to articles, do not pitch products. Just receive the kindness graciously and reflect their energy back.`;
+    } else if (intent.intent === 'refund_cancel' || intent.intent === 'returns_damaged') {
+      intentGuidance = `\n\nNote on intent: '${intent.intent}' involves money/policy. Be empathetic but do NOT promise specific refunds, replacements, or exceptions — say you'll check with the team and follow up.`;
+    }
+
     const userPrompt = `Customer message:
 Channel: ${channelLabel}
 Subject: ${ticketData.subject || '(none)'}
@@ -1226,7 +1248,7 @@ Help Center articles that might be relevant:
 ${articlesContext}
 
 ---
-Intent classified as: ${intent.intent} (confidence ${intent.confidence})
+Intent classified as: ${intent.intent} (confidence ${intent.confidence})${intentGuidance}
 
 Write the reply as Kristine.`;
 
