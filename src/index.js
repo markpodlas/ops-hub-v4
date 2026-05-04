@@ -1784,6 +1784,7 @@ async function handleCxAgentAPI(request, env, path) {
     // GET /cx-agent/api/training/list?limit=50&filter=needs_review|all|rated
     // Returns tickets that have a draft AND a captured human reply, joined with rating.
     if (path === '/cx-agent/api/training/list' && request.method === 'GET') {
+      const url = new URL(request.url);
       const limit = Math.min(parseInt(url.searchParams.get('limit') || '50'), 200);
       const filter = url.searchParams.get('filter') || 'needs_review';
       const intent = url.searchParams.get('intent') || null;
