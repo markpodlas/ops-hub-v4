@@ -510,6 +510,7 @@ async function loadAllTasks(retries = 3) {
         platform: t.platform,
         color: t.color || "#666",
         customFields: t.customFields || [],
+        tags: t.tags || [],
         url: t.url
       }));
       
@@ -1193,12 +1194,15 @@ function renderMobileList() {
           const isStory = t.listName?.toLowerCase().includes("ig stor") || t.listName?.toLowerCase().includes("story");
           const qotdField = isStory ? t.customFields.find(f => f.name && f.name.toLowerCase().includes("qotd") && (f.type === "checkbox" || f.type_config)) : null;
           const showQotd = qotdField && (qotdField.value === "true" || qotdField.value === true);
+          const isReelOrFeed = (t.platform?.toLowerCase().includes("ig post") || t.platform?.toLowerCase().includes("ig reels") || t.listName?.toLowerCase().includes("ig post") || t.listName?.toLowerCase().includes("ig reels"));
+          const showManychat = isReelOrFeed && Array.isArray(t.tags) && t.tags.some(tag => String(tag).toLowerCase() === "manychat");
           
           html += `<div class="mobile-task" style="background:${t.color}" onclick="showModal('${t.id}')">
             ${timeStr ? `<span class="mobile-task-time">${escHTML(timeStr)}</span>` : ''}
             <span class="mobile-task-name">${escHTML(t.name)}</span>
             ${showStar ? '<span style="font-size:11px">⭐</span>' : ''}
             ${showQotd ? '<span style="font-size:11px">📅</span>' : ''}
+            ${showManychat ? '<span style="font-size:11px">🤖</span>' : ''}
             <span class="mobile-task-emoji">${emoji}</span>
           </div>`;
         });
@@ -1276,6 +1280,18 @@ function taskPillHTML(task, expanded) {
     }
   }
   
+  // Check for Manychat — shows 🤖 on IG Reels and IG Posts (Feed) when task has "manychat" tag
+  let manychatHTML = "";
+  const platformLower = task.platform?.toLowerCase() || "";
+  const listNameLower = task.listName?.toLowerCase() || "";
+  const isReelOrFeed = platformLower.includes("ig post") || platformLower.includes("ig reels") || listNameLower.includes("ig post") || listNameLower.includes("ig reels");
+  if (isReelOrFeed && Array.isArray(task.tags)) {
+    const hasManychat = task.tags.some(tag => String(tag).toLowerCase() === "manychat");
+    if (hasManychat) {
+      manychatHTML = `<span class="task-pill-emoji" style="font-size:10px">🤖</span>`;
+    }
+  }
+  
   let badgesHTML = "";
   if (showFields && config.calendarFields.length > 0) {
     let badges = [];
@@ -1348,6 +1364,7 @@ function taskPillHTML(task, expanded) {
     <span class="task-pill-name">${escHTML(task.name)}</span>
     ${starHTML}
     ${qotdHTML}
+    ${manychatHTML}
     <span class="task-pill-emoji">${emoji}</span>
     ${badgesHTML}
     ${expanded ? `<span class="task-pill-meta">${task.brand} · ${task.platform}</span>` : ''}
