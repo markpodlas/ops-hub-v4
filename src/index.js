@@ -2093,6 +2093,325 @@ async function handleCxAgentAPI(request, env, path) {
   }
 }
 
+// ===== ICP MODULE =====
+// Pulls Klaviyo profiles + Ordered Product events into D1 so we can do
+// cross-segment product analysis that Klaviyo's UI won't let us do natively.
+// Required env: KLAVIYO_API_KEY (Wrangler secret, read access to profiles + events)
+
+const KLAVIYO_API = "https://a.klaviyo.com/api";
+const KLAVIYO_REVISION = "2024-10-15";
+
+async function initIcpTables(db) {
+  await db.batch([
+    db.prepare(`CREATE TABLE IF NOT EXISTS icp_profiles (
+      profile_id TEXT PRIMARY KEY,
+      email TEXT,
+      role_or_stage TEXT,
+      created_kl TEXT,
+      updated_kl TEXT,
+      synced_at TEXT DEFAULT (datetime('now'))
+    )`),
+    db.prepare(`CREATE TABLE IF NOT EXISTS icp_order_items (
+      event_id TEXT PRIMARY KEY,
+      profile_id TEXT NOT NULL,
+      order_date TEXT NOT NULL,
+      sku TEXT,
+      product_name TEXT,
+      quantity INTEGER DEFAULT 1,
+      line_value REAL DEFAULT 0,
+      synced_at TEXT DEFAULT (datetime('now'))
+    )`),
+    db.prepare(`CREATE TABLE IF NOT EXISTS icp_sync_state (
+      key TEXT PRIMARY KEY,
+      value TEXT,
+      updated_at TEXT DEFAULT (datetime('now'))
+    )`),
+    db.prepare(`CREATE INDEX IF NOT EXISTS idx_icp_profiles_role ON icp_profiles(role_or_stage)`),
+    db.prepare(`CREATE INDEX IF NOT EXISTS idx_icp_items_profile ON icp_order_items(profile_id)`),
+    db.prepare(`CREATE INDEX IF NOT EXISTS idx_icp_items_sku ON icp_order_items(sku)`),
+    db.prepare(`CREATE INDEX IF NOT EXISTS idx_icp_items_date ON icp_order_items(order_date)`),
+  ]);
+}
+
+async function klaviyoFetch(url, env) {
+  const res = await fetch(url, {
+    headers: {
+      "Authorization": `Klaviyo-API-Key ${env.KLAVIYO_API_KEY}`,
+      "Accept": "application/json",
+      "revision": KLAVIYO_REVISION,
+    },
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Klaviyo ${res.status}: ${text.slice(0, 200)}`);
+  }
+  return res.json();
+}
+
+async function syncIcpProfiles(env, opts = {}) {
+  const db = env.DB;
+  const limit = opts.maxPages || 300; // covers ~30k profiles
+  let url = `${KLAVIYO_API}/profiles/?fields[profile]=email,properties,created,updated&page[size]=100`;
+  let pages = 0;
+  let written = 0;
+
+  while (url && pages < limit) {
+    const data = await klaviyoFetch(url, env);
+    const profiles = data.data || [];
+
+    if (profiles.length > 0) {
+      const stmts = profiles.map(p => {
+        const props = p.attributes?.properties || {};
+        // Adjust property keys here if your form uses a different exact name
+        const role = props["role_or_stage"] || props["Role Or Stage"] || props["Are you a..."] || null;
+        return db.prepare(
+          `INSERT OR REPLACE INTO icp_profiles (profile_id, email, role_or_stage, created_kl, updated_kl, synced_at)
+           VALUES (?, ?, ?, ?, ?, datetime('now'))`
+        ).bind(
+          p.id,
+          p.attributes?.email || null,
+          role,
+          p.attributes?.created || null,
+          p.attributes?.updated || null,
+        );
+      });
+      await db.batch(stmts);
+      written += profiles.length;
+    }
+
+    url = data.links?.next || null;
+    pages++;
+  }
+
+  await db.prepare(
+    `INSERT OR REPLACE INTO icp_sync_state (key, value, updated_at) VALUES (?, ?, datetime('now'))`
+  ).bind("profiles_last_sync", new Date().toISOString()).run();
+
+  return { profiles_synced: written, pages };
+}
+
+async function syncIcpOrderEvents(env, opts = {}) {
+  const db = env.DB;
+  const maxPages = opts.maxPages || 500;
+
+  // Find the Ordered Product metric ID (cached after first lookup)
+  let metricId = null;
+  const cached = await db.prepare(
+    `SELECT value FROM icp_sync_state WHERE key = 'ordered_product_metric_id'`
+  ).first();
+  if (cached?.value) {
+    metricId = cached.value;
+  } else {
+    const metricsData = await klaviyoFetch(`${KLAVIYO_API}/metrics/?filter=equals(integration.name,"Shopify")`, env);
+    const metric = (metricsData.data || []).find(m =>
+      m.attributes?.name === "Ordered Product"
+    );
+    if (!metric) throw new Error("Could not find Ordered Product metric — is Shopify connected to Klaviyo?");
+    metricId = metric.id;
+    await db.prepare(
+      `INSERT OR REPLACE INTO icp_sync_state (key, value, updated_at) VALUES (?, ?, datetime('now'))`
+    ).bind("ordered_product_metric_id", metricId).run();
+  }
+
+  // Determine since-date: incremental if we've synced before, else 365 days
+  const sinceRow = await db.prepare(
+    `SELECT value FROM icp_sync_state WHERE key = 'events_last_sync'`
+  ).first();
+  const sinceISO = opts.fullBackfill || !sinceRow?.value
+    ? new Date(Date.now() - 365 * 24 * 60 * 60 * 1000).toISOString()
+    : sinceRow.value;
+
+  const filter = `and(equals(metric_id,"${metricId}"),greater-than(datetime,${sinceISO}))`;
+  let url = `${KLAVIYO_API}/events/?filter=${encodeURIComponent(filter)}&fields[event]=event_properties,datetime&include=profile&page[size]=100`;
+
+  let pages = 0;
+  let written = 0;
+
+  while (url && pages < maxPages) {
+    const data = await klaviyoFetch(url, env);
+    const events = data.data || [];
+
+    if (events.length > 0) {
+      const validEvents = events.filter(e => e.relationships?.profile?.data?.id);
+      const stmts = validEvents.map(e => {
+        const props = e.attributes?.event_properties || {};
+        const sku = props.SKU || props.sku || props.ProductID || null;
+        const name = props.ProductName || props.product_name || props.Title || null;
+        const qty = parseInt(props.Quantity || props.quantity || 1) || 1;
+        const value = parseFloat(props.RowTotal || props.row_total || props.ProductPrice || props.LineValue || props.value || 0) || 0;
+        const profileId = e.relationships.profile.data.id;
+        return db.prepare(
+          `INSERT OR REPLACE INTO icp_order_items (event_id, profile_id, order_date, sku, product_name, quantity, line_value, synced_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))`
+        ).bind(e.id, profileId, e.attributes?.datetime, sku, name, qty, value);
+      });
+      if (stmts.length > 0) await db.batch(stmts);
+      written += stmts.length;
+    }
+
+    url = data.links?.next || null;
+    pages++;
+  }
+
+  await db.prepare(
+    `INSERT OR REPLACE INTO icp_sync_state (key, value, updated_at) VALUES (?, ?, datetime('now'))`
+  ).bind("events_last_sync", new Date().toISOString()).run();
+
+  return { events_synced: written, pages, since: sinceISO };
+}
+
+async function handleIcpAPI(request, env, path) {
+  const cors = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type",
+    "Content-Type": "application/json",
+  };
+  if (request.method === "OPTIONS") return new Response(null, { headers: cors });
+
+  const db = env.DB;
+  await initIcpTables(db);
+
+  try {
+    if (path === "/icp/api/sync/profiles" && request.method === "POST") {
+      if (!env.KLAVIYO_API_KEY) return new Response(JSON.stringify({ error: "KLAVIYO_API_KEY not configured" }), { status: 500, headers: cors });
+      const result = await syncIcpProfiles(env);
+      return new Response(JSON.stringify({ ok: true, ...result }), { headers: cors });
+    }
+
+    if (path === "/icp/api/sync/events" && request.method === "POST") {
+      if (!env.KLAVIYO_API_KEY) return new Response(JSON.stringify({ error: "KLAVIYO_API_KEY not configured" }), { status: 500, headers: cors });
+      const url = new URL(request.url);
+      const fullBackfill = url.searchParams.get("full") === "1";
+      const result = await syncIcpOrderEvents(env, { fullBackfill });
+      return new Response(JSON.stringify({ ok: true, ...result }), { headers: cors });
+    }
+
+    if (path === "/icp/api/status" && request.method === "GET") {
+      const [profiles, items, syncState] = await db.batch([
+        db.prepare(`SELECT COUNT(*) as c, COUNT(DISTINCT role_or_stage) as roles FROM icp_profiles`),
+        db.prepare(`SELECT COUNT(*) as c, MIN(order_date) as earliest, MAX(order_date) as latest FROM icp_order_items`),
+        db.prepare(`SELECT key, value, updated_at FROM icp_sync_state`),
+      ]);
+      return new Response(JSON.stringify({
+        profiles: profiles.results[0],
+        order_items: items.results[0],
+        sync_state: syncState.results,
+      }), { headers: cors });
+    }
+
+    if (path === "/icp/api/segments" && request.method === "GET") {
+      const url = new URL(request.url);
+      const days = parseInt(url.searchParams.get("days") || "365");
+      const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+
+      const profileCounts = await db.prepare(`
+        SELECT role_or_stage, COUNT(*) as profile_count
+        FROM icp_profiles
+        WHERE role_or_stage IS NOT NULL
+        GROUP BY role_or_stage
+      `).all();
+
+      const orderStats = await db.prepare(`
+        SELECT
+          p.role_or_stage,
+          COUNT(DISTINCT oi.profile_id) as buyers,
+          COUNT(*) as line_items,
+          SUM(oi.quantity) as units,
+          SUM(oi.line_value) as revenue
+        FROM icp_order_items oi
+        JOIN icp_profiles p ON p.profile_id = oi.profile_id
+        WHERE p.role_or_stage IS NOT NULL
+          AND oi.order_date >= ?
+        GROUP BY p.role_or_stage
+      `).bind(cutoff).all();
+
+      const byRole = {};
+      for (const r of profileCounts.results) {
+        byRole[r.role_or_stage] = {
+          role: r.role_or_stage,
+          profile_count: r.profile_count,
+          buyers: 0, line_items: 0, units: 0, revenue: 0,
+        };
+      }
+      for (const r of orderStats.results) {
+        if (!byRole[r.role_or_stage]) {
+          byRole[r.role_or_stage] = { role: r.role_or_stage, profile_count: 0 };
+        }
+        Object.assign(byRole[r.role_or_stage], {
+          buyers: r.buyers || 0,
+          line_items: r.line_items || 0,
+          units: r.units || 0,
+          revenue: r.revenue || 0,
+        });
+      }
+      return new Response(JSON.stringify({ days, segments: Object.values(byRole) }), { headers: cors });
+    }
+
+    if (path === "/icp/api/product-segments" && request.method === "GET") {
+      const url = new URL(request.url);
+      const days = parseInt(url.searchParams.get("days") || "365");
+      const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+      const role = url.searchParams.get("role");
+
+      let query = `
+        SELECT
+          COALESCE(oi.product_name, oi.sku, '(unknown)') as product,
+          oi.sku,
+          p.role_or_stage as role,
+          SUM(oi.quantity) as units,
+          SUM(oi.line_value) as revenue,
+          COUNT(DISTINCT oi.profile_id) as buyers
+        FROM icp_order_items oi
+        JOIN icp_profiles p ON p.profile_id = oi.profile_id
+        WHERE p.role_or_stage IS NOT NULL
+          AND oi.order_date >= ?
+      `;
+      const params = [cutoff];
+      if (role) { query += ` AND p.role_or_stage = ?`; params.push(role); }
+      query += ` GROUP BY product, oi.sku, role ORDER BY units DESC`;
+
+      const result = await db.prepare(query).bind(...params).all();
+      return new Response(JSON.stringify({ days, rows: result.results }), { headers: cors });
+    }
+
+    if (path === "/icp/api/first-purchase" && request.method === "GET") {
+      const url = new URL(request.url);
+      const days = parseInt(url.searchParams.get("days") || "365");
+      const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+
+      const result = await db.prepare(`
+        WITH first_dates AS (
+          SELECT profile_id, MIN(order_date) as first_date
+          FROM icp_order_items
+          WHERE order_date >= ?
+          GROUP BY profile_id
+        )
+        SELECT
+          p.role_or_stage as role,
+          COALESCE(oi.product_name, oi.sku, '(unknown)') as product,
+          oi.sku,
+          COUNT(DISTINCT oi.profile_id) as first_buyers,
+          SUM(oi.quantity) as units
+        FROM icp_order_items oi
+        JOIN first_dates fd
+          ON fd.profile_id = oi.profile_id
+         AND fd.first_date = oi.order_date
+        JOIN icp_profiles p ON p.profile_id = oi.profile_id
+        WHERE p.role_or_stage IS NOT NULL
+        GROUP BY p.role_or_stage, product, oi.sku
+        ORDER BY p.role_or_stage, first_buyers DESC
+      `).bind(cutoff).all();
+
+      return new Response(JSON.stringify({ days, rows: result.results }), { headers: cors });
+    }
+
+    return new Response(JSON.stringify({ error: "Not found" }), { status: 404, headers: cors });
+  } catch (err) {
+    return new Response(JSON.stringify({ error: err.message, stack: err.stack }), { status: 500, headers: cors });
+  }
+}
+
 // ===== MAIN WORKER =====
 export default {
   async fetch(request, env, ctx) {
@@ -2111,6 +2430,8 @@ export default {
     if (path === "/cx-agent/webhook/zendesk") { return handleCxAgentWebhook(request, env, ctx); }
     if (path === "/cx-agent/webhook/zendesk-reply") { return handleCxAgentReplyWebhook(request, env, ctx); }
     if (path.startsWith("/cx-agent/api/")) { return handleCxAgentAPI(request, env, path); }
+    // ===== ICP =====
+    if (path.startsWith("/icp/api/")) { return handleIcpAPI(request, env, path); }
     // ===== CONTENT TRACKER API (D1-backed) =====
     if (path === "/tracker/api/data") { return handleTrackerAPI(request, env); }
     // ===== 3PL API (D1-backed) =====
@@ -2129,6 +2450,7 @@ export default {
     if (path === "/ambassadors") return Response.redirect(url.origin + "/ambassadors/", 301);
     if (path === "/tracker") return Response.redirect(url.origin + "/tracker/", 301);
     if (path === "/cx-agent") return Response.redirect(url.origin + "/cx-agent/", 301);
+    if (path === "/icp") return Response.redirect(url.origin + "/icp/", 301);
     // ===== LANDING PAGE =====
     if (path === "/" || path === "") { return new Response(landingPageHTML(), { headers: { "Content-Type": "text/html;charset=UTF-8", "X-Robots-Tag": "noindex, nofollow" } }); }
     // ===== AMBASSADOR API =====
@@ -2177,6 +2499,7 @@ body{background:#0a0f1a;color:#f1f5f9;font-family:'DM Sans',sans-serif;min-heigh
   <a href="/tracker/">Tracker</a>
   <a href="/ambassadors/">Ambassadors</a>
   <a href="/cx-agent/">CX Agent</a>
+  <a href="/icp/">ICP</a>
 </nav>
 <div class="hub-wrap">
 <div class="hub">
@@ -2188,6 +2511,7 @@ body{background:#0a0f1a;color:#f1f5f9;font-family:'DM Sans',sans-serif;min-heigh
     <a href="/tracker/" class="app-card"><div class="app-icon">\u{1F3AF}</div><div class="app-name">Content Tracker</div><div class="app-desc">IG performance scoring & attribution</div></a>
     <a href="/ambassadors/" class="app-card"><div class="app-icon">\u{1F91D}</div><div class="app-name">Ambassadors</div><div class="app-desc">Ambassador sales & commission tracking</div></a>
     <a href="/cx-agent/" class="app-card"><div class="app-icon">\u{1F916}</div><div class="app-name">CX Agent</div><div class="app-desc">AI customer support automation</div></a>
+    <a href="/icp/" class="app-card"><div class="app-icon">\u{1F3AF}</div><div class="app-name">ICP Analytics</div><div class="app-desc">Klaviyo segment + product analysis</div></a>
   </div>
 </div>
 </div></body></html>`;

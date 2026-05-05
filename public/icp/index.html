@@ -1,0 +1,422 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>NITM ICP Analytics</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #0a0f1a; color: #f1f5f9; font-family: 'DM Sans', system-ui, -apple-system, sans-serif; min-height: 100vh; }
+    .top-nav { background: linear-gradient(180deg,#1a2332 0%,#141c28 100%); padding: 12px 24px; display: flex; align-items: center; gap: 24px; border-bottom: 1px solid #1e293b; }
+    .top-nav .brand { color: #f1f5f9; font-weight: 700; font-size: 14px; text-decoration: none; letter-spacing: 0.5px; }
+    .top-nav a { color: #64748b; text-decoration: none; font-size: 13px; font-weight: 500; transition: color 0.15s; }
+    .top-nav a:hover, .top-nav a.active { color: #f1f5f9; }
+    .wrap { max-width: 1400px; margin: 0 auto; padding: 32px 24px 80px; }
+    h1 { font-size: 28px; font-weight: 700; letter-spacing: -0.3px; margin-bottom: 8px; }
+    .subtitle { color: #64748b; font-size: 14px; margin-bottom: 28px; }
+    .panel { background: #111827; border: 1px solid #1f2937; border-radius: 12px; padding: 24px; margin-bottom: 20px; }
+    .panel h2 { font-size: 16px; font-weight: 600; margin-bottom: 16px; color: #e2e8f0; }
+    .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+    button { background: #334155; color: #f1f5f9; border: none; padding: 10px 18px; border-radius: 8px; font-size: 13px; font-weight: 600; cursor: pointer; transition: background 0.15s; font-family: inherit; }
+    button:hover:not(:disabled) { background: #475569; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    button.primary { background: #2563eb; }
+    button.primary:hover:not(:disabled) { background: #1d4ed8; }
+    select, input { background: #1e293b; color: #f1f5f9; border: 1px solid #334155; padding: 8px 12px; border-radius: 6px; font-size: 13px; font-family: inherit; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th { text-align: left; padding: 10px 12px; background: #1e293b; color: #94a3b8; font-weight: 600; font-size: 11px; letter-spacing: 0.5px; text-transform: uppercase; border-bottom: 1px solid #334155; position: sticky; top: 0; }
+    td { padding: 10px 12px; border-bottom: 1px solid #1e293b; color: #cbd5e1; }
+    tr:hover td { background: #161e2e; }
+    .num { text-align: right; font-variant-numeric: tabular-nums; }
+    .pct { color: #94a3b8; font-size: 12px; }
+    .pct.positive { color: #34d399; }
+    .pct.negative { color: #f87171; }
+    .status-line { font-size: 12px; color: #64748b; margin-top: 8px; }
+    .tabs { display: flex; gap: 4px; margin-bottom: 20px; border-bottom: 1px solid #1f2937; }
+    .tab { padding: 10px 16px; cursor: pointer; color: #64748b; font-size: 13px; font-weight: 500; border-bottom: 2px solid transparent; transition: all 0.15s; }
+    .tab.active { color: #f1f5f9; border-bottom-color: #2563eb; }
+    .tab:hover { color: #cbd5e1; }
+    .empty { text-align: center; padding: 60px 20px; color: #64748b; }
+    .error { background: #2d1414; border: 1px solid #7f1d1d; color: #fca5a5; padding: 12px 16px; border-radius: 8px; font-size: 13px; margin-bottom: 16px; font-family: monospace; word-break: break-word; }
+    .stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; }
+    .stat { background: #1e293b; padding: 16px; border-radius: 8px; }
+    .stat-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; color: #64748b; margin-bottom: 6px; }
+    .stat-value { font-size: 22px; font-weight: 700; color: #f1f5f9; font-variant-numeric: tabular-nums; }
+    .badge { display: inline-block; background: #1e293b; color: #94a3b8; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 500; margin-left: 6px; }
+    .product-cell { max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .help { font-size: 12px; color: #64748b; line-height: 1.5; margin-top: 12px; }
+    .help code { background: #1e293b; padding: 1px 6px; border-radius: 3px; font-size: 11px; }
+    .loading { color: #64748b; padding: 20px; text-align: center; font-size: 13px; }
+    @media(max-width:700px){ .wrap{padding:20px 12px 60px} .panel{padding:16px} h1{font-size:22px} }
+  </style>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/@babel/standalone@7.24.0/babel.min.js"></script>
+</head>
+<body>
+  <nav class="top-nav">
+    <span class="brand">NITM Ops</span>
+    <a href="/">Hub</a>
+    <a href="/calendar/">Calendar</a>
+    <a href="/inventory/">Inventory</a>
+    <a href="/3pl/">3PL</a>
+    <a href="/tracker/">Tracker</a>
+    <a href="/ambassadors/">Ambassadors</a>
+    <a href="/cx-agent/">CX Agent</a>
+    <a href="/icp/" class="active">ICP</a>
+  </nav>
+  <div id="root"></div>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useMemo, useCallback } = React;
+
+const fmtNum = (n) => n == null ? "—" : Number(n).toLocaleString();
+const fmtMoney = (n) => n == null ? "—" : "$" + Number(n).toLocaleString(undefined, { minimumFractionDigits: 0, maximumFractionDigits: 0 });
+const fmtPct = (n) => n == null ? "—" : (Number(n) * 100).toFixed(1) + "%";
+const fmtDate = (s) => { if (!s) return "never"; try { return new Date(s).toLocaleString(); } catch { return s; } };
+
+function useApi(path, deps = []) {
+  const [data, setData] = useState(null);
+  const [error, setError] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  const reload = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const res = await fetch(path);
+      const j = await res.json();
+      if (!res.ok) throw new Error(j.error || ("HTTP " + res.status));
+      setData(j);
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setLoading(false);
+    }
+  }, [path]);
+
+  useEffect(() => { reload(); }, deps); // eslint-disable-line
+
+  return { data, error, loading, reload };
+}
+
+function StatusPanel({ status, onSync, syncing, syncMsg }) {
+  if (!status) return null;
+  const profilesSync = status.sync_state?.find(r => r.key === "profiles_last_sync");
+  const eventsSync = status.sync_state?.find(r => r.key === "events_last_sync");
+  return (
+    <div className="panel">
+      <h2>Data sync status</h2>
+      <div className="stat-grid">
+        <div className="stat">
+          <div className="stat-label">Profiles in DB</div>
+          <div className="stat-value">{fmtNum(status.profiles?.c)}</div>
+          <div className="status-line">across {status.profiles?.roles || 0} role/stage values</div>
+        </div>
+        <div className="stat">
+          <div className="stat-label">Order line items</div>
+          <div className="stat-value">{fmtNum(status.order_items?.c)}</div>
+          <div className="status-line">{status.order_items?.earliest ? `from ${status.order_items.earliest.slice(0,10)}` : "—"}</div>
+        </div>
+        <div className="stat">
+          <div className="stat-label">Profiles last synced</div>
+          <div className="stat-value" style={{fontSize: 14}}>{fmtDate(profilesSync?.updated_at)}</div>
+        </div>
+        <div className="stat">
+          <div className="stat-label">Events last synced</div>
+          <div className="stat-value" style={{fontSize: 14}}>{fmtDate(eventsSync?.updated_at)}</div>
+        </div>
+      </div>
+      <div className="row" style={{marginTop: 16}}>
+        <button onClick={() => onSync("profiles")} disabled={syncing}>Sync profiles from Klaviyo</button>
+        <button onClick={() => onSync("events")} disabled={syncing}>Sync recent orders</button>
+        <button className="primary" onClick={() => onSync("events", true)} disabled={syncing}>
+          Full 365-day backfill
+        </button>
+        {syncing && <span className="status-line">Syncing… this can take several minutes</span>}
+        {syncMsg && <span className="status-line">{syncMsg}</span>}
+      </div>
+      <div className="help">
+        First time? Click <code>Sync profiles</code> first, then <code>Full 365-day backfill</code>.
+        Subsequent runs: just <code>Sync profiles</code> + <code>Sync recent orders</code> (incremental).
+      </div>
+    </div>
+  );
+}
+
+function SegmentSummary({ days }) {
+  const { data, error, loading } = useApi(`/icp/api/segments?days=${days}`, [days]);
+  const rows = useMemo(() => {
+    if (!data?.segments) return [];
+    const totalProfiles = data.segments.reduce((s, x) => s + (x.profile_count || 0), 0);
+    const totalRevenue = data.segments.reduce((s, x) => s + (x.revenue || 0), 0);
+    const totalOrders = data.segments.reduce((s, x) => s + (x.line_items || 0), 0);
+    const totalBuyers = data.segments.reduce((s, x) => s + (x.buyers || 0), 0);
+    return data.segments
+      .map(s => ({
+        ...s,
+        list_share: totalProfiles ? s.profile_count / totalProfiles : 0,
+        rev_share: totalRevenue ? (s.revenue || 0) / totalRevenue : 0,
+        buy_rate: s.profile_count ? (s.buyers || 0) / s.profile_count : 0,
+        aov: s.line_items ? (s.revenue || 0) / s.line_items : 0,
+        rev_per_profile: s.profile_count ? (s.revenue || 0) / s.profile_count : 0,
+        share_delta: totalRevenue && totalProfiles
+          ? ((s.revenue || 0) / totalRevenue) - (s.profile_count / totalProfiles)
+          : 0,
+      }))
+      .sort((a, b) => (b.revenue || 0) - (a.revenue || 0))
+      .concat([{
+        role: "TOTAL",
+        profile_count: totalProfiles,
+        buyers: totalBuyers,
+        line_items: totalOrders,
+        revenue: totalRevenue,
+        list_share: 1,
+        rev_share: 1,
+        buy_rate: totalProfiles ? totalBuyers / totalProfiles : 0,
+        aov: totalOrders ? totalRevenue / totalOrders : 0,
+        rev_per_profile: totalProfiles ? totalRevenue / totalProfiles : 0,
+        share_delta: 0,
+        _total: true,
+      }]);
+  }, [data]);
+
+  if (loading) return <div className="panel"><div className="loading">Loading segment summary…</div></div>;
+  if (error) return <div className="panel"><div className="error">{error}</div></div>;
+  if (!rows.length) return <div className="panel"><div className="empty">No data yet — run a sync first.</div></div>;
+
+  return (
+    <div className="panel">
+      <h2>Segment overview <span className="badge">last {days} days</span></h2>
+      <div style={{overflowX: "auto"}}>
+        <table>
+          <thead>
+            <tr>
+              <th>Segment</th>
+              <th className="num">Profiles</th>
+              <th className="num">List %</th>
+              <th className="num">Buyers</th>
+              <th className="num">Buy rate</th>
+              <th className="num">Orders</th>
+              <th className="num">Revenue</th>
+              <th className="num">Rev %</th>
+              <th className="num">Δ share</th>
+              <th className="num">AOV</th>
+              <th className="num">Rev / profile</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((r, i) => (
+              <tr key={i} style={r._total ? {fontWeight: 700, background: "#161e2e"} : {}}>
+                <td>{r.role}</td>
+                <td className="num">{fmtNum(r.profile_count)}</td>
+                <td className="num pct">{fmtPct(r.list_share)}</td>
+                <td className="num">{fmtNum(r.buyers)}</td>
+                <td className="num pct">{fmtPct(r.buy_rate)}</td>
+                <td className="num">{fmtNum(r.line_items)}</td>
+                <td className="num">{fmtMoney(r.revenue)}</td>
+                <td className="num pct">{fmtPct(r.rev_share)}</td>
+                <td className={"num pct " + (r._total ? "" : (r.share_delta > 0 ? "positive" : r.share_delta < 0 ? "negative" : ""))}>
+                  {r._total ? "—" : ((r.share_delta > 0 ? "+" : "") + (r.share_delta * 100).toFixed(1) + "pp")}
+                </td>
+                <td className="num">{fmtMoney(r.aov)}</td>
+                <td className="num">{fmtMoney(r.rev_per_profile)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <div className="help">
+        <strong>Δ share</strong> = revenue share minus list share. Positive = segment punches above its weight. Negative = under-converting relative to size.
+      </div>
+    </div>
+  );
+}
+
+function ProductCrossTab({ days }) {
+  const { data, error, loading } = useApi(`/icp/api/product-segments?days=${days}`, [days]);
+
+  const { roles, productRows } = useMemo(() => {
+    if (!data?.rows) return { roles: [], productRows: [] };
+    const roleSet = new Set();
+    const productMap = new Map(); // key: product, val: {product, sku, byRole: {role: {units, revenue}}, total}
+    for (const r of data.rows) {
+      roleSet.add(r.role);
+      const key = r.product + "||" + (r.sku || "");
+      if (!productMap.has(key)) {
+        productMap.set(key, { product: r.product, sku: r.sku, byRole: {}, totalUnits: 0, totalRevenue: 0 });
+      }
+      const p = productMap.get(key);
+      p.byRole[r.role] = { units: r.units || 0, revenue: r.revenue || 0, buyers: r.buyers || 0 };
+      p.totalUnits += r.units || 0;
+      p.totalRevenue += r.revenue || 0;
+    }
+    return {
+      roles: Array.from(roleSet).sort(),
+      productRows: Array.from(productMap.values()).sort((a, b) => b.totalUnits - a.totalUnits),
+    };
+  }, [data]);
+
+  if (loading) return <div className="panel"><div className="loading">Loading product cross-tab…</div></div>;
+  if (error) return <div className="panel"><div className="error">{error}</div></div>;
+  if (!productRows.length) return <div className="panel"><div className="empty">No product data yet.</div></div>;
+
+  return (
+    <div className="panel">
+      <h2>Product mix by segment <span className="badge">last {days} days</span></h2>
+      <div style={{overflowX: "auto", maxHeight: 600}}>
+        <table>
+          <thead>
+            <tr>
+              <th>Product</th>
+              <th>SKU</th>
+              {roles.map(r => <th key={r} className="num">{r}</th>)}
+              <th className="num">Total units</th>
+              <th className="num">Total revenue</th>
+            </tr>
+          </thead>
+          <tbody>
+            {productRows.map((p, i) => (
+              <tr key={i}>
+                <td className="product-cell" title={p.product}>{p.product}</td>
+                <td style={{color: "#64748b", fontSize: 11}}>{p.sku || ""}</td>
+                {roles.map(r => (
+                  <td key={r} className="num">{p.byRole[r] ? fmtNum(p.byRole[r].units) : "—"}</td>
+                ))}
+                <td className="num"><strong>{fmtNum(p.totalUnits)}</strong></td>
+                <td className="num">{fmtMoney(p.totalRevenue)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <div className="help">
+        Sorted by total units across all segments. Cell values are units sold to that segment.
+      </div>
+    </div>
+  );
+}
+
+function FirstPurchase({ days }) {
+  const { data, error, loading } = useApi(`/icp/api/first-purchase?days=${days}`, [days]);
+  const grouped = useMemo(() => {
+    if (!data?.rows) return [];
+    const byRole = {};
+    for (const r of data.rows) {
+      if (!byRole[r.role]) byRole[r.role] = [];
+      byRole[r.role].push(r);
+    }
+    return Object.entries(byRole).map(([role, rows]) => ({
+      role,
+      rows: rows.slice(0, 10),
+      total: rows.reduce((s, x) => s + (x.first_buyers || 0), 0),
+    }));
+  }, [data]);
+
+  if (loading) return <div className="panel"><div className="loading">Loading first-purchase data…</div></div>;
+  if (error) return <div className="panel"><div className="error">{error}</div></div>;
+  if (!grouped.length) return <div className="panel"><div className="empty">No first-purchase data yet.</div></div>;
+
+  return (
+    <div className="panel">
+      <h2>Gateway products by segment <span className="badge">last {days} days</span></h2>
+      <div className="help" style={{marginTop: 0, marginBottom: 16}}>
+        First products purchased by each segment in the window. The top product here is your gateway SKU for that audience.
+      </div>
+      {grouped.map(g => (
+        <div key={g.role} style={{marginBottom: 24}}>
+          <h3 style={{fontSize: 14, color: "#94a3b8", marginBottom: 8}}>{g.role} <span className="badge">{g.total} first buyers</span></h3>
+          <table>
+            <thead>
+              <tr>
+                <th>#</th>
+                <th>Product</th>
+                <th>SKU</th>
+                <th className="num">First buyers</th>
+                <th className="num">Share of first buyers</th>
+              </tr>
+            </thead>
+            <tbody>
+              {g.rows.map((r, i) => (
+                <tr key={i}>
+                  <td style={{color: "#64748b", width: 30}}>{i + 1}</td>
+                  <td className="product-cell" title={r.product}>{r.product}</td>
+                  <td style={{color: "#64748b", fontSize: 11}}>{r.sku || ""}</td>
+                  <td className="num">{fmtNum(r.first_buyers)}</td>
+                  <td className="num pct">{fmtPct(g.total ? r.first_buyers / g.total : 0)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function App() {
+  const [tab, setTab] = useState("overview");
+  const [days, setDays] = useState(365);
+  const [syncing, setSyncing] = useState(false);
+  const [syncMsg, setSyncMsg] = useState("");
+  const [statusKey, setStatusKey] = useState(0);
+
+  const { data: status, error: statusError, reload: reloadStatus } = useApi(`/icp/api/status?_=${statusKey}`, [statusKey]);
+
+  const onSync = async (kind, full = false) => {
+    setSyncing(true);
+    setSyncMsg("");
+    try {
+      const url = kind === "profiles" ? "/icp/api/sync/profiles" : `/icp/api/sync/events${full ? "?full=1" : ""}`;
+      const res = await fetch(url, { method: "POST" });
+      const j = await res.json();
+      if (!res.ok) throw new Error(j.error || ("HTTP " + res.status));
+      setSyncMsg(kind === "profiles"
+        ? `Synced ${j.profiles_synced} profiles across ${j.pages} pages.`
+        : `Synced ${j.events_synced} order line items across ${j.pages} pages.`);
+      setStatusKey(k => k + 1);
+    } catch (e) {
+      setSyncMsg("Error: " + e.message);
+    } finally {
+      setSyncing(false);
+    }
+  };
+
+  return (
+    <div className="wrap">
+      <h1>ICP Analytics</h1>
+      <div className="subtitle">Klaviyo profile + order data, joined locally so we can do the cross-cuts the Klaviyo UI won't.</div>
+
+      {statusError && <div className="error">{statusError}</div>}
+
+      <StatusPanel status={status} onSync={onSync} syncing={syncing} syncMsg={syncMsg} />
+
+      <div className="tabs">
+        <div className={"tab " + (tab === "overview" ? "active" : "")} onClick={() => setTab("overview")}>Segment overview</div>
+        <div className={"tab " + (tab === "products" ? "active" : "")} onClick={() => setTab("products")}>Product × segment</div>
+        <div className={"tab " + (tab === "first" ? "active" : "")} onClick={() => setTab("first")}>Gateway products</div>
+      </div>
+
+      <div className="panel" style={{paddingTop: 16, paddingBottom: 16}}>
+        <div className="row">
+          <span style={{fontSize: 13, color: "#94a3b8"}}>Window:</span>
+          <select value={days} onChange={e => setDays(parseInt(e.target.value))}>
+            <option value={30}>Last 30 days</option>
+            <option value={90}>Last 90 days</option>
+            <option value={180}>Last 180 days</option>
+            <option value={365}>Last 365 days</option>
+          </select>
+        </div>
+      </div>
+
+      {tab === "overview" && <SegmentSummary days={days} />}
+      {tab === "products" && <ProductCrossTab days={days} />}
+      {tab === "first" && <FirstPurchase days={days} />}
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
