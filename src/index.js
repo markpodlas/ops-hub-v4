@@ -4029,6 +4029,119 @@ async function handleCxAgentAPI(request, env, path) {
       return new Response(JSON.stringify({ conversations }), { headers: cors });
     }
 
+    // GET /cx-agent/api/training/tickets?filter=needs_review|rated|all&intent=&limit=
+    // Zendesk-style LIST view: one compact row per ticket the agent drafted on, with review
+    // progress. The heavy thread content is only loaded when a row is opened.
+    if (path === '/cx-agent/api/training/tickets' && request.method === 'GET') {
+      const url = new URL(request.url);
+      const limit = Math.min(parseInt(url.searchParams.get('limit') || '100'), 300);
+      const filter = url.searchParams.get('filter') || 'needs_review';
+      const intent = url.searchParams.get('intent') || null;
+
+      const params = [];
+      let having = '1=1';
+      if (filter === 'needs_review') having = 'reviewed < ai_replies';
+      if (filter === 'rated') having = 'reviewed > 0';
+      let intentWhere = '';
+      if (intent) { intentWhere = 'AND t.classified_intent = ?'; params.push(intent); }
+      params.push(limit);
+
+      const rows = (await db.prepare(`
+        SELECT t.id AS ticket_id, t.zendesk_ticket_id, t.subject, t.customer_email, t.channel,
+               t.classified_intent, t.intent_confidence, t.received_at, t.status, t.final_action,
+               COUNT(DISTINCT r.id) AS ai_replies,
+               COUNT(DISTINCT CASE WHEN hr.rating IS NOT NULL THEN r.id END) AS reviewed,
+               COUNT(DISTINCT CASE WHEN hr.id IS NOT NULL THEN r.id END) AS with_human_reply,
+               MAX(COALESCE(hr.reply_created_at, r.created_at)) AS last_activity
+        FROM agent_tickets t
+        JOIN agent_responses r ON r.ticket_id = t.id
+        LEFT JOIN agent_human_replies hr ON hr.response_id = r.id
+        WHERE t.status != 'ignored' ${intentWhere}
+        GROUP BY t.id
+        HAVING ${having}
+        ORDER BY last_activity DESC
+        LIMIT ?
+      `).bind(...params).all()).results || [];
+
+      return new Response(JSON.stringify({ tickets: rows }), { headers: cors });
+    }
+
+    // GET /cx-agent/api/training/thread?ticket=<agent ticket id>
+    // Full conversation for one ticket, rendered as a Zendesk-like chronological thread:
+    // customer message -> AI draft (reviewable) -> what the team actually sent -> repeat.
+    if (path === '/cx-agent/api/training/thread' && request.method === 'GET') {
+      const url = new URL(request.url);
+      const tid = parseInt(url.searchParams.get('ticket') || '0');
+      if (!tid) return new Response(JSON.stringify({ error: 'pass ?ticket=<ticket_id>' }), { status: 400, headers: cors });
+
+      const ticket = await db.prepare(
+        `SELECT id, zendesk_ticket_id, subject, customer_email, channel, classified_intent,
+                intent_confidence, received_at, status, final_action
+         FROM agent_tickets WHERE id = ?`
+      ).bind(tid).first();
+      if (!ticket) return new Response(JSON.stringify({ error: 'ticket not found' }), { status: 404, headers: cors });
+
+      const turns = (await db.prepare(`
+        SELECT r.id AS response_id, r.draft_body,
+               COALESCE(r.customer_message, t.first_customer_message) AS customer_message,
+               r.response_confidence,
+               COALESCE(r.turn_number,1) AS turn_number, COALESCE(r.is_followup,0) AS is_followup,
+               r.data_sources, r.status AS response_status, r.created_at AS drafted_at,
+               hr.id AS reply_id, hr.body AS human_reply, hr.author_name, hr.reply_created_at,
+               hr.rating, hr.rating_note, hr.rated_at, hr.source AS reply_source
+        FROM agent_responses r
+        JOIN agent_tickets t ON t.id = r.ticket_id
+        LEFT JOIN agent_human_replies hr ON hr.response_id = r.id
+        WHERE r.ticket_id = ?
+        ORDER BY COALESCE(r.turn_number,1) ASC, r.created_at ASC
+      `).bind(tid).all()).results || [];
+
+      // Dedupe responses matched to multiple replies (prefer a rated one).
+      const seen = new Map();
+      for (const row of turns) {
+        const prev = seen.get(row.response_id);
+        if (!prev || (!prev.rating && row.rating)) seen.set(row.response_id, row);
+      }
+      // Any team replies we captured that aren't linked to a specific draft — show them so the
+      // thread isn't missing messages the customer actually received.
+      const unlinked = (await db.prepare(
+        `SELECT id AS reply_id, body AS human_reply, author_name, reply_created_at, rating, rating_note, source AS reply_source
+         FROM agent_human_replies WHERE ticket_id = ? AND response_id IS NULL
+         ORDER BY reply_created_at ASC`
+      ).bind(tid).all()).results || [];
+
+      return new Response(JSON.stringify({ ticket, turns: [...seen.values()], unlinked_replies: unlinked }), { headers: cors });
+    }
+
+    // POST /cx-agent/api/training/correct-draft  { response_id, text, author? }
+    // Lets a reviewer rewrite an AI draft into what it SHOULD have said. Stored as a manual
+    // "human reply" tied to that draft, so it becomes rateable and feeds the few-shot examples
+    // as the gold standard — the strongest correction signal we can collect.
+    if (path === '/cx-agent/api/training/correct-draft' && request.method === 'POST') {
+      const body = await request.json();
+      const responseId = parseInt(body.response_id || 0);
+      const text = String(body.text || '').trim();
+      if (!responseId || text.length < 10) {
+        return new Response(JSON.stringify({ error: 'response_id and text (min 10 chars) required' }), { status: 400, headers: cors });
+      }
+      const resp = await db.prepare('SELECT id, ticket_id FROM agent_responses WHERE id = ?').bind(responseId).first();
+      if (!resp) return new Response(JSON.stringify({ error: 'response not found' }), { status: 404, headers: cors });
+      const zid = (await db.prepare('SELECT zendesk_ticket_id FROM agent_tickets WHERE id = ?').bind(resp.ticket_id).first())?.zendesk_ticket_id;
+
+      const existing = await db.prepare('SELECT id FROM agent_human_replies WHERE response_id = ? ORDER BY id LIMIT 1').bind(responseId).first();
+      if (existing) {
+        await db.prepare(
+          `UPDATE agent_human_replies SET body = ?, source = 'manual', author_name = ?, learned_at = NULL WHERE id = ?`
+        ).bind(text, body.author || 'edited in Ops Hub', existing.id).run();
+        return new Response(JSON.stringify({ updated: true, reply_id: existing.id }), { headers: cors });
+      }
+      const ins = await db.prepare(
+        `INSERT INTO agent_human_replies (ticket_id, zendesk_ticket_id, body, author_name, reply_created_at, source, response_id)
+         VALUES (?, ?, ?, ?, datetime('now'), 'manual', ?)`
+      ).bind(resp.ticket_id, String(zid || ''), text, body.author || 'edited in Ops Hub', responseId).run();
+      return new Response(JSON.stringify({ created: true, reply_id: ins.meta.last_row_id }), { headers: cors });
+    }
+
     // POST /cx-agent/api/training/rate
     // Body: { reply_id, rating: 'good'|'minor'|'rewrite'|'flag', rating_note?, rated_by? }
     if (path === '/cx-agent/api/training/rate' && request.method === 'POST') {
