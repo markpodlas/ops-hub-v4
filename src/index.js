@@ -1349,6 +1349,25 @@ async function initCxAgentTables(db) {
       created_at TEXT DEFAULT (datetime('now')),
       updated_at TEXT DEFAULT (datetime('now'))
     )`),
+    // v4.12: ONE durable knowledge store. Entries come from three sources — authored by the
+    // team, imported from a reviewer's rating note, or derived by the agent itself by diffing
+    // its draft against the human's actual reply. Only 'approved' entries reach the prompt, so
+    // the agent can never teach itself something unreviewed.
+    db.prepare(`CREATE TABLE IF NOT EXISTS agent_knowledge (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      category TEXT NOT NULL DEFAULT 'policy',
+      content TEXT NOT NULL,
+      norm_key TEXT,
+      source TEXT NOT NULL DEFAULT 'authored',
+      source_ref TEXT,
+      status TEXT NOT NULL DEFAULT 'approved',
+      evidence TEXT,
+      reviewed_by TEXT,
+      created_at TEXT DEFAULT (datetime('now')),
+      updated_at TEXT DEFAULT (datetime('now'))
+    )`),
+    db.prepare(`CREATE UNIQUE INDEX IF NOT EXISTS idx_knowledge_norm ON agent_knowledge(norm_key)`),
+    db.prepare(`CREATE INDEX IF NOT EXISTS idx_knowledge_status ON agent_knowledge(status)`),
     // v4.9: background product-extraction jobs. The browser splits a PDF into chunk PDFs
     // (stored in R2 under job/<id>/chunk/<n>.pdf); the cron reads each chunk via Claude
     // native PDF, accumulates partials, merges, and saves the product — fully hands-off.
@@ -1482,6 +1501,9 @@ async function initCxAgentTables(db) {
     ['hard_escalate_intents', '["educator_institutional","partnership"]', 'json', 'INTENTS that always escalate to a human with no customer reply (hard_escalate_topics matches topics, not intents)'],
     ['grounding_check_enabled', 'true', 'boolean', 'Verify each draft against its context and strip claims it cannot support'],
     ['order_action_proposals_enabled', 'true', 'boolean', 'For refund/return tickets, post a proposed action plan (read-only; a human executes it)'],
+    ['self_learning_enabled', 'true', 'boolean', 'Nightly pass that derives lessons from rated replies (proposed for approval, never applied unreviewed)'],
+    ['knowledge_max_entries', '40', 'number', 'Max approved knowledge entries injected into each draft'],
+    ['last_learn_run', '', 'string', 'Timestamp of the last self-learning pass (managed automatically)'],
   ];
   for (const [key, value, value_type, description] of v411Keys) {
     const exists = await db.prepare("SELECT 1 FROM agent_config WHERE key = ?").bind(key).first();
@@ -1495,6 +1517,7 @@ async function initCxAgentTables(db) {
     "ALTER TABLE agent_responses ADD COLUMN turn_number INTEGER DEFAULT 1",
     "ALTER TABLE agent_responses ADD COLUMN customer_message TEXT",
     "ALTER TABLE agent_human_replies ADD COLUMN response_id INTEGER",
+    "ALTER TABLE agent_human_replies ADD COLUMN learned_at TEXT",
   ]) { try { await db.prepare(ddl).run(); } catch {} }
 
   const existingTpl = await db.prepare("SELECT COUNT(*) as c FROM agent_templates").first();
@@ -2499,25 +2522,138 @@ async function cxFetchExampleReplies(db, intent, limit = 6) {
   }
 }
 
-// v4.12: reviewer notes are standing instructions, not per-intent trivia. A correction like
-// "we offer free shipping over $50" should apply to EVERY reply, not just the one intent it
-// happened to be written on. Pull the recent distinct notes as a team-lessons list.
-async function cxFetchTeamLessons(db, limit = 12) {
+// v4.12: normalized key for de-duplicating knowledge entries (same lesson, different wording
+// still collides on the obvious cases; the extractor also gets shown existing entries).
+function cxNormKey(s) {
+  return String(s || '').toLowerCase().replace(/[^a-z0-9 ]/g, '').replace(/\s+/g, ' ').trim().slice(0, 180);
+}
+
+// Insert a knowledge entry, ignoring exact/near duplicates (unique index on norm_key).
+async function cxAddKnowledge(db, { category = 'policy', content, source = 'authored', source_ref = null, status = 'approved', evidence = null, reviewed_by = null }) {
+  const text = String(content || '').trim();
+  if (text.length < 8) return { added: false, reason: 'too short' };
+  try {
+    const res = await db.prepare(
+      `INSERT OR IGNORE INTO agent_knowledge (category, content, norm_key, source, source_ref, status, evidence, reviewed_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    ).bind(category, text, cxNormKey(text), source, source_ref, status, evidence, reviewed_by).run();
+    return { added: (res.meta?.changes || 0) > 0 };
+  } catch (err) {
+    return { added: false, reason: err.message };
+  }
+}
+
+// The approved knowledge the drafter is allowed to rely on.
+async function cxFetchKnowledge(db, limit = 40) {
   try {
     const rows = await db.prepare(`
-      SELECT hr.rating_note AS note, MAX(hr.rated_at) AS latest, t.classified_intent AS intent
-      FROM agent_human_replies hr
-      JOIN agent_tickets t ON t.id = hr.ticket_id
-      WHERE hr.rating_note IS NOT NULL AND length(trim(hr.rating_note)) > 8
-      GROUP BY lower(trim(hr.rating_note))
-      ORDER BY latest DESC
+      SELECT category, content, source FROM agent_knowledge
+      WHERE status = 'approved'
+      ORDER BY CASE category WHEN 'policy' THEN 0 WHEN 'product' THEN 1 WHEN 'process' THEN 2 ELSE 3 END,
+               updated_at DESC
       LIMIT ?
     `).bind(limit).all();
     return rows.results || [];
   } catch (err) {
-    console.error('cxFetchTeamLessons error:', err);
+    console.error('cxFetchKnowledge error:', err);
     return [];
   }
+}
+
+// v4.12: THE SELF-LEARNING PASS.
+// Two jobs:
+//  1. Import any new reviewer rating_notes as approved knowledge (a human wrote it → trusted).
+//  2. For rated replies where the human's reply diverged from the draft, ask the model to
+//     derive the durable lesson by DIFFING the two — so corrections teach even when nobody
+//     had time to write a note. Those land as 'proposed' and never reach a draft until a
+//     human approves them.
+async function cxRunSelfLearning(env, db, { maxReplies = 15 } = {}) {
+  const summary = { notes_imported: 0, diffs_examined: 0, lessons_proposed: 0, skipped: 0, errors: 0 };
+  if ((await cxGetConfig(db, 'self_learning_enabled')) === false) return { ...summary, disabled: true };
+
+  // --- 1. Reviewer notes → approved knowledge (deduped by norm_key).
+  try {
+    const notes = (await db.prepare(`
+      SELECT hr.id, hr.rating_note AS note, t.classified_intent AS intent
+      FROM agent_human_replies hr JOIN agent_tickets t ON t.id = hr.ticket_id
+      WHERE hr.rating_note IS NOT NULL AND length(trim(hr.rating_note)) > 8
+      ORDER BY hr.rated_at DESC LIMIT 200
+    `).all()).results || [];
+    for (const n of notes) {
+      const r = await cxAddKnowledge(db, {
+        category: 'policy', content: n.note, source: 'note',
+        source_ref: `reply:${n.id}`, status: 'approved',
+        evidence: `Reviewer note on a "${n.intent}" ticket`,
+      });
+      if (r.added) summary.notes_imported++;
+    }
+  } catch (e) { summary.errors++; }
+
+  // --- 2. Derive lessons from draft-vs-human differences on rated replies not yet learned from.
+  try {
+    const rows = (await db.prepare(`
+      SELECT hr.id AS reply_id, hr.rating, hr.body AS human_reply, hr.rating_note,
+             r.draft_body AS agent_draft, COALESCE(r.customer_message, t.first_customer_message) AS customer_msg,
+             t.classified_intent AS intent, t.zendesk_ticket_id
+      FROM agent_human_replies hr
+      JOIN agent_tickets t ON t.id = hr.ticket_id
+      LEFT JOIN agent_responses r ON r.id = hr.response_id
+      WHERE hr.rating IN ('rewrite','minor','flag')
+        AND hr.learned_at IS NULL
+        AND hr.body IS NOT NULL AND length(trim(hr.body)) > 40
+        AND r.draft_body IS NOT NULL
+      ORDER BY hr.rated_at DESC LIMIT ?
+    `).bind(maxReplies).all()).results || [];
+
+    if (rows.length) {
+      const model = (await cxGetConfig(db, 'classifier_model')) || (await cxGetConfig(db, 'anthropic_model'));
+      // Show the extractor what we already know so it doesn't re-propose the same lesson.
+      const existing = (await cxFetchKnowledge(db, 60)).map(k => `- ${k.content}`).join('\n') || '(nothing yet)';
+
+      for (const row of rows) {
+        summary.diffs_examined++;
+        try {
+          const sys = `You improve a customer-support AI by learning from human corrections. You are shown a customer message, the AI's DRAFT reply, and the reply a human actually sent. Work out what DURABLE lesson would have made the draft correct.
+
+A good lesson is a reusable fact or rule, stated plainly and specific to this business — e.g. "NurseInTheMaking+ access lasts 1 year from the purchase date", "For return policy questions, link to our refund policy page", "Write in first person".
+
+Return NOTHING (null) when: the difference is only phrasing/word choice with no reusable rule, the human's reply is specific to that one customer's order, or the lesson is ALREADY covered by the existing knowledge listed below.
+
+Classify each lesson: "policy" (rules, pricing, terms, entitlements), "product" (what something is/includes), "process" (how we handle a situation), "tone" (voice/style).
+
+Return ONLY valid JSON:
+{"lesson": "<one sentence rule, or null>", "category": "policy|product|process|tone", "confidence": 0.0-1.0}
+
+ALREADY KNOWN (do not repeat these):
+${existing}`;
+          const user = `Intent: ${row.intent}\n\nCUSTOMER WROTE:\n${String(row.customer_msg || '').slice(0, 1200)}\n\nAI DRAFT (rated "${row.rating}"):\n${String(row.agent_draft || '').slice(0, 2000)}\n\nWHAT THE HUMAN ACTUALLY SENT:\n${String(row.human_reply || '').slice(0, 2000)}${row.rating_note ? `\n\nREVIEWER'S OWN NOTE: ${row.rating_note}` : ''}`;
+
+          const resp = await cxCallClaude(env, model, sys, user, 500);
+          const parsed = cxExtractJson(resp.content);
+          const lesson = parsed?.lesson;
+          if (lesson && String(lesson).trim().toLowerCase() !== 'null' && String(lesson).trim().length > 12 && (parsed.confidence ?? 1) >= 0.6) {
+            const add = await cxAddKnowledge(db, {
+              category: ['policy', 'product', 'process', 'tone'].includes(parsed.category) ? parsed.category : 'policy',
+              content: String(lesson).trim(),
+              source: 'rewrite_diff',
+              source_ref: `reply:${row.reply_id} ticket:${row.zendesk_ticket_id}`,
+              status: 'proposed', // never used until a human approves
+              evidence: `Derived from a "${row.rating}" on ticket #${row.zendesk_ticket_id} (${row.intent})`,
+            });
+            if (add.added) summary.lessons_proposed++;
+          } else {
+            summary.skipped++;
+          }
+          await db.prepare("UPDATE agent_human_replies SET learned_at = datetime('now') WHERE id = ?").bind(row.reply_id).run();
+        } catch (e) {
+          summary.errors++;
+        }
+      }
+    }
+  } catch (e) { summary.errors++; }
+
+  try { await db.prepare("UPDATE agent_config SET value = datetime('now'), updated_at = datetime('now') WHERE key = 'last_learn_run'").run(); } catch {}
+  return summary;
 }
 
 // v4.11: ShipMonk fulfillment state for one order. Tries a live lookup first (freshness
@@ -2706,7 +2842,7 @@ Then produce corrected_reply: the same reply with each unsupported claim REMOVED
 
 Return ONLY valid JSON: {"unsupported":[{"claim":"<exact quote>","why":"<short reason>"}],"corrected_reply":"<full corrected reply>"}
 If everything is supported, return {"unsupported":[],"corrected_reply":"<reply unchanged>"}.`;
-    const user = `CONTEXT AVAILABLE TO THE ASSISTANT:\n\n--- Customer's orders ---\n${contextBlocks.orders || '(none)'}\n\n--- Help Center articles ---\n${(contextBlocks.articles || '(none)').substring(0, 6000)}\n\n--- Product coverage ---\n${contextBlocks.products || '(none)'}\n\n--- Customer's message ---\n${(contextBlocks.customerMessage || '').substring(0, 1500)}\n\nREPLY TO CHECK:\n${draft}`;
+    const user = `CONTEXT AVAILABLE TO THE ASSISTANT:\n\n--- Customer's orders ---\n${contextBlocks.orders || '(none)'}\n\n--- Help Center articles ---\n${(contextBlocks.articles || '(none)').substring(0, 6000)}\n\n--- Product coverage ---\n${contextBlocks.products || '(none)'}\n\n--- Verified NITM knowledge (team-approved facts — these fully support any claim they cover) ---\n${contextBlocks.knowledge || '(none)'}\n\n--- Customer's message ---\n${(contextBlocks.customerMessage || '').substring(0, 1500)}\n\nREPLY TO CHECK:\n${draft}`;
     const resp = await cxCallClaude(env, model, sys, user, 2000);
     const parsed = cxExtractJson(resp.content);
     if (!parsed) return out;
@@ -2796,7 +2932,8 @@ async function cxDraftGeneralSuggestion(ticketId, ticketData, intent, db, env, t
   // STEP: Pull vetted past human replies for this intent as few-shot voice examples
   const examples = await tracer.trace('training_examples', async () => {
     const rows = await cxFetchExampleReplies(db, intent.intent, 6);
-    const lessons = await cxFetchTeamLessons(db, 12);
+    const maxK = (await cxGetConfig(db, 'knowledge_max_entries')) || 40;
+    const lessons = await cxFetchKnowledge(db, maxK);
     return {
       count: rows.length,
       with_notes: rows.filter(r => r.rating_note && String(r.rating_note).trim()).length,
@@ -2854,8 +2991,13 @@ async function cxDraftGeneralSuggestion(ticketId, ticketData, intent, db, env, t
     // Standing corrections the CX team has written while reviewing past drafts. These are
     // direct instructions from the people who own this inbox — they outrank your instincts.
     const lessonsBlock = examples._lessons?.length
-      ? `\n\nCORRECTIONS FROM THE CX TEAM — these came from reviewing your past replies. Follow them; they override your own assumptions. If one contradicts what you were about to write, the team is right:\n` +
-        examples._lessons.map(l => `- ${String(l.note).trim().substring(0, 300)}${l.intent ? ` (noted on a "${l.intent}" ticket)` : ''}`).join('\n')
+      ? `\n\nVERIFIED NITM KNOWLEDGE — approved by the CX team from reviewing your past replies. Treat every line as fact and follow it; it overrides your own assumptions. These ALSO count as grounding: you may state them confidently.\n` +
+        ['policy', 'product', 'process', 'tone'].map(cat => {
+          const items = examples._lessons.filter(l => (l.category || 'policy') === cat);
+          if (!items.length) return '';
+          const label = { policy: 'Policies & terms', product: 'Products', process: 'How we handle things', tone: 'Voice' }[cat];
+          return `\n${label}:\n` + items.map(l => `- ${String(l.content).trim().substring(0, 300)}`).join('\n');
+        }).filter(Boolean).join('')
       : '';
 
     const systemPrompt = `You are Kristine, founder of Nurse In The Making (NITM), a nursing education company. Write a helpful customer service reply in Kristine's warm, supportive tone.
@@ -2949,7 +3091,13 @@ Write the reply as Kristine.`;
       },
       // Keep the exact context strings so the grounding check verifies against what the
       // drafter actually saw (not a re-derivation).
-      _context: { orders: ordersContext, articles: articlesContext, products: productsContext, customerMessage: ticketData.firstMessage || '' },
+      _context: {
+        orders: ordersContext, articles: articlesContext, products: productsContext,
+        // Approved team knowledge is a legitimate factual source — the grounding checker must
+        // see it too, or it would strip claims the team has explicitly verified.
+        knowledge: (examples._lessons || []).map(l => `- ${l.content}`).join('\n'),
+        customerMessage: ticketData.firstMessage || '',
+      },
       _tokens: claudeResp.tokens,
       _cost: claudeResp.cost
     };
@@ -3044,7 +3192,8 @@ Write the reply as Kristine.`;
   // tag, still draft) | auto_reply (send when all gates pass, else fall back to a draft).
   const mode = await cxGetConfig(db, 'mode');
   let decision = { pass: false, reason: 'mode=internal_note' };
-  const groundingSources = (response.data_sources?.orders_found || 0) + (response.data_sources?.articles_used || 0) + (response.data_sources?.products_used || 0);
+  const groundingSources = (response.data_sources?.orders_found || 0) + (response.data_sources?.articles_used || 0)
+    + (response.data_sources?.products_used || 0) + (examples.lessons_count || 0);
   if (ticketData.humanActive) {
     // A teammate owns this ticket — NEVER auto-send over them, regardless of mode/gates.
     decision = { pass: false, reason: 'a teammate has replied on this ticket — suggestion only' };
@@ -3635,6 +3784,67 @@ async function handleCxAgentAPI(request, env, path) {
       const body = await request.json();
       await db.prepare("UPDATE agent_templates SET body = ?, updated_at = datetime('now') WHERE id = ?").bind(body.body, parseInt(tplMatch[1])).run();
       return new Response(JSON.stringify({ updated: true }), { headers: cors });
+    }
+
+    // ==========================================================================
+    // v4.12: KNOWLEDGE / SELF-LEARNING APIs
+    // ==========================================================================
+
+    // GET /cx-agent/api/knowledge?status=proposed|approved|all
+    if (path === '/cx-agent/api/knowledge' && request.method === 'GET') {
+      const url = new URL(request.url);
+      const status = url.searchParams.get('status') || 'all';
+      let where = '1=1';
+      if (status === 'proposed') where = "status = 'proposed'";
+      if (status === 'approved') where = "status = 'approved'";
+      const rows = (await db.prepare(
+        `SELECT id, category, content, source, source_ref, status, evidence, created_at, updated_at
+         FROM agent_knowledge WHERE ${where}
+         ORDER BY CASE status WHEN 'proposed' THEN 0 ELSE 1 END,
+                  CASE category WHEN 'policy' THEN 0 WHEN 'product' THEN 1 WHEN 'process' THEN 2 ELSE 3 END,
+                  updated_at DESC LIMIT 400`
+      ).all()).results || [];
+      const counts = (await db.prepare("SELECT status, COUNT(*) n FROM agent_knowledge GROUP BY status").all()).results || [];
+      const lastRun = await cxGetConfig(db, 'last_learn_run');
+      return new Response(JSON.stringify({ entries: rows, counts, last_learn_run: lastRun || null }), { headers: cors });
+    }
+
+    // POST /cx-agent/api/knowledge  { id?, content, category?, status? } — create or edit
+    if (path === '/cx-agent/api/knowledge' && request.method === 'POST') {
+      const body = await request.json();
+      if (!body.content || String(body.content).trim().length < 8) {
+        return new Response(JSON.stringify({ error: 'content required (min 8 chars)' }), { status: 400, headers: cors });
+      }
+      const content = String(body.content).trim();
+      if (body.id) {
+        await db.prepare(`UPDATE agent_knowledge SET content=?, norm_key=?, category=COALESCE(?,category), status=COALESCE(?,status), updated_at=datetime('now') WHERE id=?`)
+          .bind(content, cxNormKey(content), body.category ?? null, body.status ?? null, parseInt(body.id)).run();
+        return new Response(JSON.stringify({ updated: true, id: parseInt(body.id) }), { headers: cors });
+      }
+      const r = await cxAddKnowledge(db, { category: body.category || 'policy', content, source: 'authored', status: body.status || 'approved', reviewed_by: body.reviewed_by || 'team' });
+      return new Response(JSON.stringify(r.added ? { created: true } : { created: false, reason: r.reason || 'duplicate' }), { headers: cors });
+    }
+
+    // POST /cx-agent/api/knowledge/:id/(approve|reject|delete)
+    const kMatch = path.match(/^\/cx-agent\/api\/knowledge\/(\d+)\/(approve|reject|delete)$/);
+    if (kMatch && request.method === 'POST') {
+      const id = parseInt(kMatch[1]);
+      const action = kMatch[2];
+      if (action === 'delete') {
+        await db.prepare("DELETE FROM agent_knowledge WHERE id = ?").bind(id).run();
+      } else {
+        await db.prepare("UPDATE agent_knowledge SET status = ?, reviewed_by = ?, updated_at = datetime('now') WHERE id = ?")
+          .bind(action === 'approve' ? 'approved' : 'rejected', 'team', id).run();
+      }
+      return new Response(JSON.stringify({ ok: true, id, action }), { headers: cors });
+    }
+
+    // POST /cx-agent/api/knowledge/learn-now — run the self-learning pass on demand
+    if (path === '/cx-agent/api/knowledge/learn-now' && request.method === 'POST') {
+      const url = new URL(request.url);
+      const max = Math.min(Math.max(parseInt(url.searchParams.get('max') || '15'), 1), 40);
+      const summary = await cxRunSelfLearning(env, db, { maxReplies: max });
+      return new Response(JSON.stringify(summary), { headers: cors });
     }
 
     // ==========================================================================
@@ -6668,6 +6878,16 @@ export default {
     ctx.waitUntil((async () => { try { await processProductJobs(env); } catch (e) { /* non-fatal */ } })());
     // Catch customer follow-ups even if the Zendesk reply trigger doesn't fire.
     ctx.waitUntil((async () => { try { await sweepFollowups(env); } catch (e) { /* non-fatal */ } })());
+    // Self-learning: derive lessons from newly-rated replies, once every ~24h.
+    ctx.waitUntil((async () => {
+      try {
+        const db = env.CX_AGENT_DB;
+        if (!db) return;
+        const last = await cxGetConfig(db, 'last_learn_run');
+        if (last && (Date.now() - new Date(last.replace(' ', 'T') + 'Z').getTime()) < 23 * 60 * 60 * 1000) return;
+        await cxRunSelfLearning(env, db, { maxReplies: 15 });
+      } catch (e) { /* non-fatal */ }
+    })());
     // Incremental ShipMonk orders sync, gated to ~every 10 min (cron fires every 2 min).
     ctx.waitUntil((async () => {
       try {

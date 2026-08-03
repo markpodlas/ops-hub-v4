@@ -153,6 +153,7 @@
   <button class="tab" data-tab="config">Configuration</button>
   <button class="tab" data-tab="templates">Response Templates</button>
   <button class="tab" data-tab="products">Products</button>
+  <button class="tab" data-tab="knowledge">Knowledge</button>
 </div>
 
 <!-- TICKETS TAB -->
@@ -275,6 +276,31 @@
   </div>
 </div>
 
+<!-- KNOWLEDGE TAB -->
+<div class="tab-panel" id="tab-knowledge">
+  <div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:16px;margin-bottom:16px">
+    <div style="font-weight:600;font-size:15px;margin-bottom:4px">🧠 Verified Knowledge</div>
+    <div style="color:var(--text-muted);font-size:13px;margin-bottom:12px">
+      Facts and rules the agent is allowed to state as truth. Entries come from three places: written by you, imported from your rating notes, or <b>learned by the agent itself</b> by comparing its drafts to what your team actually sent. Agent-learned entries stay <b>proposed</b> until someone approves them — nothing unreviewed ever reaches a reply.
+    </div>
+    <div style="display:flex;gap:10px;align-items:flex-start;flex-wrap:wrap">
+      <select id="k-category" style="background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:8px 10px;font-size:13px;color:var(--text);font-family:inherit">
+        <option value="policy">Policy / terms</option>
+        <option value="product">Product</option>
+        <option value="process">Process</option>
+        <option value="tone">Voice / tone</option>
+      </select>
+      <input type="text" id="k-content" placeholder='Add a fact, e.g. "NurseInTheMaking+ access lasts 1 year from the purchase date"' style="flex:1;min-width:280px;background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:8px 10px;font-size:13px;color:var(--text);font-family:inherit">
+      <button class="save-btn" style="padding:8px 16px;background:var(--accent);color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:13px;font-weight:500" onclick="addKnowledge()">Add</button>
+      <button id="learn-btn" class="save-btn" style="padding:8px 16px;background:var(--green);color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:13px;font-weight:500" onclick="learnNow()" title="Read newly-rated replies and derive lessons now (also runs nightly)">✨ Learn now</button>
+    </div>
+    <div id="k-status" style="font-size:12px;color:var(--text-muted);margin-top:8px"></div>
+  </div>
+  <div id="knowledge-list">
+    <div class="loading">Loading knowledge...</div>
+  </div>
+</div>
+
 </div>
 
 <!-- TICKET DETAIL MODAL -->
@@ -314,6 +340,7 @@ document.querySelectorAll('.tab').forEach(tab => {
     if (tab.dataset.tab === 'tickets') { loadStats(); loadTickets(); }
     if (tab.dataset.tab === 'training') { loadTrainingInsights(); loadReadiness(); loadTraining(); }
     if (tab.dataset.tab === 'products') { loadProducts(); loadProductJobs(); }
+    if (tab.dataset.tab === 'knowledge') loadKnowledge();
   });
 });
 
@@ -522,6 +549,112 @@ async function saveTemplate(id) {
   } catch (e) {
     toast('Failed: ' + e.message, 'error');
   }
+}
+
+// ============ KNOWLEDGE / SELF-LEARNING ============
+
+async function loadKnowledge() {
+  const el = document.getElementById('knowledge-list');
+  el.innerHTML = '<div class="loading">Loading knowledge...</div>';
+  try {
+    const d = await api('/knowledge?status=all');
+    const entries = d.entries || [];
+    const proposed = entries.filter(e => e.status === 'proposed');
+    const approved = entries.filter(e => e.status === 'approved');
+    const counts = {};
+    for (const c of d.counts || []) counts[c.status] = c.n;
+
+    const stat = document.getElementById('k-status');
+    if (stat) {
+      stat.innerHTML = `${counts.approved || 0} approved · ${counts.proposed || 0} awaiting review · ${counts.rejected || 0} rejected` +
+        (d.last_learn_run ? ` · last learned ${escape(d.last_learn_run)} UTC` : ' · never run yet');
+    }
+
+    const srcBadge = (s) => ({
+      authored: '<span class="pill pill-neutral" style="font-size:10px">you wrote this</span>',
+      note: '<span class="pill pill-info" style="font-size:10px">from your rating note</span>',
+      rewrite_diff: '<span class="pill pill-warn" style="font-size:10px">🤖 agent learned this</span>',
+    })[s] || '';
+    const catBadge = (c) => `<span class="pill pill-info mono" style="font-size:10px">${escape(c || 'policy')}</span>`;
+
+    const row = (e, isProposed) => `
+      <div class="card" style="background:var(--surface);border:1px solid ${isProposed ? 'var(--amber,#f5a623)' : 'var(--border)'};border-radius:8px;padding:12px 14px;margin-bottom:8px">
+        <div style="display:flex;justify-content:space-between;gap:12px;align-items:flex-start">
+          <div style="flex:1">
+            <div style="font-size:13px;line-height:1.5">${escape(e.content)}</div>
+            <div style="margin-top:6px;display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+              ${catBadge(e.category)} ${srcBadge(e.source)}
+              ${e.evidence ? `<span style="font-size:11px;color:var(--text-dim)">${escape(e.evidence)}</span>` : ''}
+            </div>
+          </div>
+          <div style="display:flex;gap:6px;flex-shrink:0">
+            ${isProposed ? `
+              <button onclick="kAction(${e.id},'approve')" class="save-btn" style="font-size:12px;padding:5px 12px;background:var(--green);color:#fff;border:none;border-radius:4px;cursor:pointer;font-weight:600">✓ Approve</button>
+              <button onclick="kAction(${e.id},'reject')" style="font-size:12px;padding:5px 12px;background:transparent;border:1px solid var(--border);color:var(--text-muted);border-radius:4px;cursor:pointer">Reject</button>
+            ` : `
+              <button onclick="kEdit(${e.id}, ${JSON.stringify(e.content).replace(/"/g, '&quot;')})" style="font-size:12px;padding:5px 10px;background:transparent;border:1px solid var(--border);color:var(--text-muted);border-radius:4px;cursor:pointer">Edit</button>
+              <button onclick="kAction(${e.id},'delete')" style="font-size:12px;padding:5px 10px;background:transparent;border:1px solid var(--border);color:var(--red,#e5484d);border-radius:4px;cursor:pointer">Delete</button>
+            `}
+          </div>
+        </div>
+      </div>`;
+
+    let html = '';
+    if (proposed.length) {
+      html += `<div style="font-weight:600;font-size:14px;margin:4px 0 8px">🤖 The agent learned these — approve to start using them (${proposed.length})</div>`;
+      html += proposed.map(e => row(e, true)).join('');
+    }
+    html += `<div style="font-weight:600;font-size:14px;margin:18px 0 8px">✅ In use by the agent (${approved.length})</div>`;
+    html += approved.length ? approved.map(e => row(e, false)).join('')
+      : '<div class="loading" style="padding:20px;text-align:center">Nothing approved yet. Add a fact above, or hit "Learn now" to see what the agent can derive from your ratings.</div>';
+    el.innerHTML = html;
+  } catch (e) {
+    el.innerHTML = '<div class="loading">Could not load: ' + escape(e.message) + '</div>';
+  }
+}
+
+async function addKnowledge() {
+  const content = document.getElementById('k-content').value.trim();
+  const category = document.getElementById('k-category').value;
+  if (content.length < 8) { toast('Write a bit more detail', 'error'); return; }
+  try {
+    const r = await api('/knowledge', { method: 'POST', body: JSON.stringify({ content, category }) });
+    toast(r.created ? 'Added to knowledge' : ('Not added: ' + (r.reason || 'duplicate')), r.created ? 'success' : 'error');
+    document.getElementById('k-content').value = '';
+    loadKnowledge();
+  } catch (e) { toast('Failed: ' + e.message, 'error'); }
+}
+
+async function kAction(id, action) {
+  if (action === 'delete' && !confirm('Delete this knowledge entry?')) return;
+  try {
+    await api('/knowledge/' + id + '/' + action, { method: 'POST' });
+    toast(action === 'approve' ? 'Approved — the agent will use this' : (action === 'reject' ? 'Rejected' : 'Deleted'), 'success');
+    loadKnowledge();
+  } catch (e) { toast('Failed: ' + e.message, 'error'); }
+}
+
+async function kEdit(id, current) {
+  const content = prompt('Edit this knowledge entry:', current);
+  if (content === null || content.trim().length < 8) return;
+  try {
+    await api('/knowledge', { method: 'POST', body: JSON.stringify({ id, content: content.trim() }) });
+    toast('Updated', 'success');
+    loadKnowledge();
+  } catch (e) { toast('Failed: ' + e.message, 'error'); }
+}
+
+async function learnNow() {
+  const btn = document.getElementById('learn-btn');
+  btn.disabled = true;
+  const original = btn.textContent;
+  btn.textContent = '✨ Learning…';
+  try {
+    const s = await api('/knowledge/learn-now?max=15', { method: 'POST' });
+    toast(`Imported ${s.notes_imported} note(s), examined ${s.diffs_examined} correction(s), proposed ${s.lessons_proposed} new lesson(s)`, 'success');
+    loadKnowledge();
+  } catch (e) { toast('Failed: ' + e.message, 'error'); }
+  finally { btn.disabled = false; btn.textContent = original; }
 }
 
 // ============ PRODUCTS (knowledge base) ============
