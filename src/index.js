@@ -4968,6 +4968,15 @@ async function handleCxAgentAPI(request, env, path) {
           return { status: r.status, ok: r.ok, json, body: json ? undefined : body.slice(0, 300) };
         } catch (e) { return { error: e.message }; }
       };
+      // Identify the KIND of credential stored without revealing it — pasting the Client ID or
+      // Client Secret instead of the Admin API access token is an easy and invisible mistake.
+      const tok = String(env.SHOPIFY_ACCESS_TOKEN || '');
+      const shape = !tok ? 'empty'
+        : tok.startsWith('shpat_') ? 'looks like an Admin API access token (shpat_…) ✓'
+        : tok.startsWith('shpss_') ? 'this is an API SECRET KEY (shpss_…) — wrong credential, you need the shpat_ Admin API access token'
+        : tok.startsWith('shpca_') ? 'this is a custom-app token prefix (shpca_…) — usually wrong for Admin API'
+        : /^[0-9a-f]{32}$/i.test(tok) ? 'this is a 32-char hex value — that is the API key / Client ID or Client Secret, NOT the Admin API access token'
+        : 'unrecognised format — expected an Admin API access token starting with shpat_';
       const shop = await probe('/admin/api/2024-01/shop.json');
       const scopesRes = await probe('/admin/oauth/access_scopes.json');
       const scopes = (scopesRes.json?.access_scopes || []).map(s => s.handle).sort();
@@ -4975,6 +4984,9 @@ async function handleCxAgentAPI(request, env, path) {
       const missing = need.filter(s => !scopes.includes(s));
       return new Response(JSON.stringify({
         token_present: !!env.SHOPIFY_ACCESS_TOKEN,
+        // Diagnostic only — never the value itself.
+        token_shape: shape,
+        token_length: tok.length,
         token_valid: shop.ok === true,
         shop: shop.json?.shop?.myshopify_domain || null,
         shop_probe_status: shop.status ?? shop.error,
