@@ -2469,8 +2469,14 @@ async function cxSearchHelpCenter(query, db, env, maxResults = 3) {
 // gold-standard answer for that ticket — so it's safe to learn Kristine's voice from it.
 // 'flag' is excluded (the interaction was problematic). Returns [] until replies are rated,
 // so this is a no-op on a cold DB and turns on automatically as ratings accumulate.
-async function cxFetchExampleReplies(db, intent, limit = 3) {
+async function cxFetchExampleReplies(db, intent, limit = 6) {
   try {
+    // Ordering matters: reviewers' effort should actually reach the prompt. Priority is
+    //   1. examples the reviewer left a NOTE on (an explicit instruction — highest signal)
+    //   2. 'rewrite' > 'minor' > 'good' (a rewrite means a human authored the whole reply
+    //      because the AI missed — the most instructive text we have)
+    //   3. most recently rated
+    // (Previously: newest-3-by-date only, so most of a large rated pool was never used.)
     const rows = await db.prepare(`
       SELECT COALESCE(r.customer_message, t.first_customer_message) AS customer_msg,
              hr.body AS human_reply, hr.rating, hr.rating_note
@@ -2480,12 +2486,36 @@ async function cxFetchExampleReplies(db, intent, limit = 3) {
       WHERE hr.rating IN ('good','minor','rewrite')
         AND t.classified_intent = ?
         AND hr.body IS NOT NULL AND length(trim(hr.body)) > 20
-      ORDER BY hr.rated_at DESC
+      ORDER BY
+        CASE WHEN hr.rating_note IS NOT NULL AND trim(hr.rating_note) != '' THEN 0 ELSE 1 END,
+        CASE hr.rating WHEN 'rewrite' THEN 0 WHEN 'minor' THEN 1 ELSE 2 END,
+        hr.rated_at DESC
       LIMIT ?
     `).bind(intent, limit).all();
     return rows.results || [];
   } catch (err) {
     console.error('cxFetchExampleReplies error:', err);
+    return [];
+  }
+}
+
+// v4.12: reviewer notes are standing instructions, not per-intent trivia. A correction like
+// "we offer free shipping over $50" should apply to EVERY reply, not just the one intent it
+// happened to be written on. Pull the recent distinct notes as a team-lessons list.
+async function cxFetchTeamLessons(db, limit = 12) {
+  try {
+    const rows = await db.prepare(`
+      SELECT hr.rating_note AS note, MAX(hr.rated_at) AS latest, t.classified_intent AS intent
+      FROM agent_human_replies hr
+      JOIN agent_tickets t ON t.id = hr.ticket_id
+      WHERE hr.rating_note IS NOT NULL AND length(trim(hr.rating_note)) > 8
+      GROUP BY lower(trim(hr.rating_note))
+      ORDER BY latest DESC
+      LIMIT ?
+    `).bind(limit).all();
+    return rows.results || [];
+  } catch (err) {
+    console.error('cxFetchTeamLessons error:', err);
     return [];
   }
 }
@@ -2765,8 +2795,15 @@ async function cxDraftGeneralSuggestion(ticketId, ticketData, intent, db, env, t
 
   // STEP: Pull vetted past human replies for this intent as few-shot voice examples
   const examples = await tracer.trace('training_examples', async () => {
-    const rows = await cxFetchExampleReplies(db, intent.intent, 3);
-    return { count: rows.length, _rows: rows };
+    const rows = await cxFetchExampleReplies(db, intent.intent, 6);
+    const lessons = await cxFetchTeamLessons(db, 12);
+    return {
+      count: rows.length,
+      with_notes: rows.filter(r => r.rating_note && String(r.rating_note).trim()).length,
+      lessons_count: lessons.length,
+      _rows: rows,
+      _lessons: lessons,
+    };
   });
 
   // STEP: For product/coverage questions, find relevant products from the knowledge base
@@ -2814,6 +2851,13 @@ async function cxDraftGeneralSuggestion(ticketId, ticketData, intent, db, env, t
         ).join('\n\n')
       : '';
 
+    // Standing corrections the CX team has written while reviewing past drafts. These are
+    // direct instructions from the people who own this inbox — they outrank your instincts.
+    const lessonsBlock = examples._lessons?.length
+      ? `\n\nCORRECTIONS FROM THE CX TEAM — these came from reviewing your past replies. Follow them; they override your own assumptions. If one contradicts what you were about to write, the team is right:\n` +
+        examples._lessons.map(l => `- ${String(l.note).trim().substring(0, 300)}${l.intent ? ` (noted on a "${l.intent}" ticket)` : ''}`).join('\n')
+      : '';
+
     const systemPrompt = `You are Kristine, founder of Nurse In The Making (NITM), a nursing education company. Write a helpful customer service reply in Kristine's warm, supportive tone.
 
 Your tone/style rules:
@@ -2844,7 +2888,7 @@ Product coverage rules (when a "Product coverage" section is provided below):
 - Keep it short and enticing — enough to answer their question, not so much that you give the material away
 - If the product coverage section is empty or doesn't cover their topic, say you're not sure it's included and offer to check
 
-Return ONLY the reply body. No subject line, no JSON, no commentary.${examplesBlock}`;
+Return ONLY the reply body. No subject line, no JSON, no commentary.${lessonsBlock}${examplesBlock}`;
 
     const channelLabel = ticketData.isMessagingChannel
       ? `${ticketData.channel} (social DM — keep reply short and casual)`
@@ -2950,6 +2994,14 @@ Write the reply as Kristine.`;
     contextLines.push('No orders found for this email');
   }
   contextLines.push(`Intent: ${intent.intent} (${Math.round(intent.confidence * 100)}%)`);
+  // Make the training loop visible — reviewers should be able to see their ratings being used.
+  if (examples.count) {
+    contextLines.push(`Learned from ${examples.count} of your rated "${intent.intent}" replies` +
+      (examples.with_notes ? ` (${examples.with_notes} with your notes)` : '') +
+      (examples.lessons_count ? ` + ${examples.lessons_count} team corrections` : ''));
+  } else {
+    contextLines.push(`No rated "${intent.intent}" examples yet — rate a few in Training Review to teach the agent this intent`);
+  }
 
   const warningLines = [];
   if (intent.intent === 'refund_cancel' || intent.intent === 'returns_damaged') {
