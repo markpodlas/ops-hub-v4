@@ -168,6 +168,7 @@
       <option value="drafted">Drafted</option>
       <option value="auto_replied">Auto-replied</option>
       <option value="escalated">Escalated</option>
+      <option value="ignored">Ignored</option>
       <option value="error">Error</option>
       <option value="processing">Processing</option>
     </select>
@@ -777,6 +778,7 @@ function statusPill(status) {
     drafted: 'pill-success',
     auto_replied: 'pill-success',
     escalated: 'pill-warn',
+    ignored: 'pill-neutral',
     error: 'pill-error'
   };
   return `<span class="pill ${map[status] || 'pill-neutral'}">${status}</span>`;
@@ -793,6 +795,7 @@ function actionPill(action) {
     'shadow_would_send':    { label: '👁 Shadow: would send', cls: 'pill-info' },
     'shadow_held':          { label: '👁 Shadow: held', cls: 'pill-neutral' },
     'suggest_close':        { label: '🗑️ Recommend close', cls: 'pill-warn' },
+    'ignored':              { label: '🚫 Ignored sender', cls: 'pill-neutral' },
     'escalated':            { label: '⚠️ Escalated', cls: 'pill-warn' }
   };
   const { label, cls } = labels[action] || { label: action, cls: 'pill-neutral' };

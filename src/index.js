@@ -1475,6 +1475,19 @@ async function initCxAgentTables(db) {
     const exists = await db.prepare("SELECT 1 FROM agent_config WHERE key = ?").bind(key).first();
     if (!exists) await db.prepare("INSERT INTO agent_config (key, value, value_type, description) VALUES (?, ?, ?, ?)").bind(key, value, value_type, description).run();
   }
+  // v4.11 migration: sender filtering, educator escalation, grounding checks.
+  const v411Keys = [
+    ['ignored_senders', '["@corsearch.com","@publisher.com"]', 'json', 'Never process tickets from these senders. Exact emails or "@domain" suffixes'],
+    ['skip_outbound_tickets', 'true', 'boolean', 'Skip tickets WE created (outbound/proactive email) — the customer did not write in'],
+    ['hard_escalate_intents', '["educator_institutional","partnership"]', 'json', 'INTENTS that always escalate to a human with no customer reply (hard_escalate_topics matches topics, not intents)'],
+    ['grounding_check_enabled', 'true', 'boolean', 'Verify each draft against its context and strip claims it cannot support'],
+    ['order_action_proposals_enabled', 'true', 'boolean', 'For refund/return tickets, post a proposed action plan (read-only; a human executes it)'],
+  ];
+  for (const [key, value, value_type, description] of v411Keys) {
+    const exists = await db.prepare("SELECT 1 FROM agent_config WHERE key = ?").bind(key).first();
+    if (!exists) await db.prepare("INSERT INTO agent_config (key, value, value_type, description) VALUES (?, ?, ?, ?)").bind(key, value, value_type, description).run();
+  }
+
   // Guarded column adds (SQLite has no ADD COLUMN IF NOT EXISTS — ignore the error if present).
   for (const ddl of [
     "ALTER TABLE agent_tickets ADD COLUMN last_followup_comment_id TEXT",
@@ -1509,6 +1522,43 @@ async function initCxAgentTables(db) {
   }
 }
 
+// v4.11: should the agent leave this ticket completely alone? Two cases:
+//  1. the sender is on the ignore list (publishers, copyright/brand-protection bots, etc.)
+//  2. WE opened the ticket (outbound/proactive email) — the customer didn't write in
+// Called from all three entry points (initial webhook, reply webhook, cron sweep).
+async function cxShouldSkipTicket(ticketData, db) {
+  try {
+    const patterns = (await cxGetConfig(db, 'ignored_senders')) || [];
+    const candidates = [
+      ticketData?.customerEmail,
+      ticketData?.ticket?.via?.source?.from?.address,
+    ].filter(Boolean).map(e => String(e).toLowerCase().trim());
+
+    for (const raw of patterns) {
+      const p = String(raw || '').toLowerCase().trim();
+      if (!p) continue;
+      for (const email of candidates) {
+        // "@domain.com" matches any address at that domain; anything else is an exact match.
+        if (p.startsWith('@') ? email.endsWith(p) : email === p) {
+          return { skip: true, reason: `sender ignored (${email} matches "${p}")` };
+        }
+      }
+    }
+
+    if ((await cxGetConfig(db, 'skip_outbound_tickets')) !== false) {
+      const t = ticketData?.ticket;
+      // submitter = who created the ticket; requester = who it's on behalf of.
+      // Different => a teammate/automation opened it, i.e. we reached out first.
+      if (t?.submitter_id && t?.requester_id && t.submitter_id !== t.requester_id) {
+        return { skip: true, reason: `outbound ticket — created by ${t.submitter_id}, not the customer (${t.requester_id})` };
+      }
+    }
+  } catch (e) {
+    console.error('cxShouldSkipTicket error:', e);
+  }
+  return { skip: false };
+}
+
 async function handleCxAgentWebhook(request, env, ctx) {
   const cors = { "Access-Control-Allow-Origin": "*", "Content-Type": "application/json" };
   if (request.method === "OPTIONS") return new Response(null, { headers: cors });
@@ -1540,6 +1590,23 @@ async function handleCxAgentWebhook(request, env, ctx) {
 
   const existing = await db.prepare("SELECT id, status FROM agent_tickets WHERE zendesk_ticket_id = ?").bind(String(zendeskTicketId)).first();
   if (existing) return new Response(JSON.stringify({ skipped: true, reason: "Already processed", ticket_id: existing.id, status: existing.status }), { headers: cors });
+
+  // v4.11: ignored sender / outbound ticket → record it so the Activity Feed explains the
+  // silence, but spend nothing (no classifier call, no Zendesk note, no tags).
+  const skipCheck = await cxShouldSkipTicket(ticketData, db);
+  if (skipCheck.skip) {
+    await db.prepare(
+      `INSERT INTO agent_tickets (zendesk_ticket_id, subject, customer_email, channel, first_customer_message, status, final_action, error_message, completed_at) VALUES (?, ?, ?, ?, ?, 'ignored', 'ignored', ?, datetime('now'))`
+    ).bind(
+      String(zendeskTicketId),
+      ticketData.subject ?? null,
+      ticketData.customerEmail ?? null,
+      ticketData.channel ?? null,
+      ticketData.firstMessage?.substring(0, 2000) ?? null,
+      skipCheck.reason
+    ).run();
+    return new Response(JSON.stringify({ skipped: true, reason: skipCheck.reason }), { headers: cors });
+  }
 
   const insertResult = await db.prepare(
     `INSERT INTO agent_tickets (zendesk_ticket_id, subject, customer_email, channel, first_customer_message, status) VALUES (?, ?, ?, ?, ?, 'processing')`
@@ -1598,6 +1665,7 @@ async function handleCxAgentReplyWebhook(request, env, ctx) {
     if ((await cxGetConfig(db, 'followup_enabled')) === false) return;
     const td = await cxFetchZendeskTicket(zendeskTicketId, db, env);
     if (!td) return;
+    if ((await cxShouldSkipTicket(td, db)).skip) return; // ignored sender / outbound
     const botId = await cxGetBotAuthorId(db, env);
     const requesterId = td.ticket?.requester_id;
     const publicComments = (td.comments || []).filter(c => c.public === true);
@@ -1730,8 +1798,16 @@ async function cxRouteIntent(db, intent) {
   const scopedIntents = await cxGetConfig(db, 'scoped_intents');
   const suggestedIntents = await cxGetConfig(db, 'suggested_intents');
   const hardEscalateTopics = await cxGetConfig(db, 'hard_escalate_topics');
+  const hardEscalateIntents = (await cxGetConfig(db, 'hard_escalate_intents')) || [];
   const minConfidence = await cxGetConfig(db, 'min_confidence_to_respond');
   const noiseSuggestionEnabled = await cxGetConfig(db, 'noise_suggestion_enabled');
+
+  // NOTE: hard_escalate_topics is matched against intent.topics (the classifier emits only
+  // clinical_question / refund_over_50 / angry / urgent). Intent-level always-escalate lives
+  // in hard_escalate_intents — entries like "partnership" in the topics list never fired.
+  if (hardEscalateIntents.includes(intent.intent)) {
+    return { route: 'escalate', reason: `Intent always requires a human: ${intent.intent}` };
+  }
 
   const hasHardTopic = hardEscalateTopics.some(t => intent.topics?.includes(t));
   if (hasHardTopic) return { route: 'escalate', reason: `Topic requires human review: ${intent.topics.join(', ')}` };
@@ -1840,6 +1916,7 @@ async function sweepFollowups(env) {
       if (!row) continue;
       const td = await cxFetchZendeskTicket(zid, db, env);
       if (!td) continue;
+      if ((await cxShouldSkipTicket(td, db)).skip) continue; // ignored sender / outbound
       const requesterId = td.ticket?.requester_id;
       const publicComments = (td.comments || []).filter(c => c.public === true);
       // A teammate replied publicly → human owns the ticket. Still draft suggestions
@@ -1880,6 +1957,7 @@ async function cxClassifyIntent(ticketData, db, env) {
 - account: Account login, password, profile issues.
 - unsubscribe: Unsubscribe requests.
 - partnership: Ambassador, collab, influencer, partnership inquiries.
+- educator_institutional: Requests from educators, faculty, schools, or institutions — course/school adoption, using our materials with their students or class, desk/review/sample copies, bulk or class-set orders, institutional or wholesale pricing, purchase orders, invoicing, W-9 or tax-exempt paperwork. Signals include "my students", "my class", "our nursing program", "faculty", "professor", "purchase order", "bulk pricing", "for our school".
 - social_engagement: Short social media messages that aren't support requests (reactions, quiz answers, thanks).
 - noise: System alerts, spam, auto-generated emails, copyright notices, anything that isn't real support.
 - other: Genuinely doesn't fit any category above.
@@ -2412,6 +2490,213 @@ async function cxFetchExampleReplies(db, intent, limit = 3) {
   }
 }
 
+// v4.11: ShipMonk fulfillment state for one order. Tries a live lookup first (freshness
+// matters when deciding whether a shipment can still be stopped), falls back to the local
+// synced snapshot. ALWAYS reports the source + age so nobody trusts a stale "not shipped".
+async function cxShipmonkOrderState(env, orderNumber) {
+  const wanted = String(orderNumber || '').replace(/^#/, '').trim();
+  if (!wanted) return { found: false, source: 'none', note: 'no order number to look up' };
+
+  // 1) Live: recent ShipMonk orders (cheap — one page, newest first).
+  try {
+    if (env.SHIPMONK_API_KEY) {
+      const data = await smFetch(env, '/orders-list', { method: 'GET', query: { page: 1, pageSize: 100, sortOrder: 'DESC' } });
+      const root = data.data || data;
+      const items = root.orders || root.items || root.results || (Array.isArray(root) ? root : []);
+      const hit = items.map(smMapOrderRow).find(r =>
+        String(r.orderNumber || '').replace(/^#/, '').trim() === wanted ||
+        String(r.shipmentId || '').replace(/^#/, '').trim() === wanted);
+      if (hit) {
+        return {
+          found: true, source: 'shipmonk_live', age: 'live (just fetched)',
+          shipped: !!hit.shipDate, ship_date: hit.shipDate || null,
+          processing_status: hit.carrierStatus || null, carrier: hit.carrier || null, service: hit.service || null,
+        };
+      }
+    }
+  } catch (e) { /* fall through to the snapshot */ }
+
+  // 2) Snapshot: the cron-synced tpl_orders table (main DB, not CX_AGENT_DB).
+  try {
+    const row = await env.DB.prepare(
+      `SELECT shipment_id, order_number, ship_date, carrier, service, carrier_status, updated_at
+       FROM tpl_orders WHERE REPLACE(order_number,'#','') = ? OR REPLACE(shipment_id,'#','') = ? LIMIT 1`
+    ).bind(wanted, wanted).first();
+    if (row) {
+      const ageMin = row.updated_at ? Math.round((Date.now() - new Date(row.updated_at + 'Z').getTime()) / 60000) : null;
+      return {
+        found: true, source: 'local_snapshot',
+        age: ageMin == null ? 'unknown' : `synced ~${ageMin} min ago`,
+        shipped: !!row.ship_date, ship_date: row.ship_date || null,
+        processing_status: row.carrier_status || null, carrier: row.carrier || null, service: row.service || null,
+      };
+    }
+  } catch (e) { /* no local data */ }
+
+  return { found: false, source: 'none', note: 'order not found in ShipMonk (live or snapshot) — may be digital-only, too old, or never sent to the 3PL' };
+}
+
+// v4.11: decide what SHOULD happen for a cancel/refund/return request. Deterministic — code
+// decides eligibility from Shopify + ShipMonk state, NOT the LLM. Read-only: proposes, never acts.
+function cxBuildOrderActionPlan(order, sm) {
+  const money = (v) => `$${Number(v || 0).toFixed(2)}`;
+  const fin = String(order.financial_status || '').toLowerCase();
+  const ful = String(order.fulfillment_status || '').toLowerCase();
+  const evidence = [
+    `Shopify ${order.name}: financial=${fin || '—'}, fulfillment=${ful || 'unfulfilled'}, total=${money(order.total_price)}, placed ${order.created_at ? new Date(order.created_at).toLocaleString() : '—'}`,
+    sm.found
+      ? `ShipMonk: ${sm.shipped ? `SHIPPED ${sm.ship_date}${sm.carrier ? ` via ${sm.carrier}` : ''}` : `not shipped (status: ${sm.processing_status || 'unknown'})`} — source: ${sm.source}, ${sm.age}`
+      : `ShipMonk: ${sm.note} — source: none`,
+  ];
+  const warnings = [];
+
+  // Terminal states first — nothing to do.
+  if (order.cancelled_at) {
+    return { recommendation: 'no_action', headline: 'Already cancelled — no action needed',
+      steps: [`Order ${order.name} was cancelled on ${new Date(order.cancelled_at).toLocaleString()}.`,
+              fin === 'refunded' ? 'Already refunded too — just confirm to the customer.' : 'Check whether a refund was issued; if not, that may still be owed.'],
+      evidence, warnings };
+  }
+  if (fin === 'refunded') {
+    return { recommendation: 'no_action', headline: 'Already fully refunded — no action needed',
+      steps: [`Order ${order.name} shows financial_status=refunded. Confirm the refund to the customer (bank posting can take 5–10 business days).`],
+      evidence, warnings };
+  }
+  if (fin === 'partially_refunded') warnings.push('Order is PARTIALLY refunded — verify what was already returned before refunding again.');
+  if (!fin || fin === 'pending' || fin === 'authorized') warnings.push(`Payment status is "${fin || 'unknown'}" — a refund may not apply; a void/cancel may be correct instead.`);
+
+  const physicallyGone = sm.found ? sm.shipped : (ful === 'fulfilled' || ful === 'partial');
+  const inFlightAtWarehouse = sm.found && !sm.shipped;
+
+  if (physicallyGone) {
+    if (!sm.found) warnings.push('No ShipMonk record — "shipped" inferred from Shopify fulfillment only. Verify in ShipMonk before telling the customer.');
+    return { recommendation: 'return_path', headline: 'Too late to cancel — handle as a return',
+      steps: [
+        `Order ${order.name} has already shipped${sm.ship_date ? ` (${sm.ship_date})` : ''} — it cannot be stopped at the warehouse.`,
+        'Confirm the return policy window applies, then issue return instructions / an RMA to the customer.',
+        `Refund ${money(order.total_price)} in Shopify only once the return is received (or per policy for damaged items).`,
+        'If it is damaged/defective, a replacement may be preferable to a refund — a human should decide.',
+      ], evidence, warnings };
+  }
+
+  if (inFlightAtWarehouse) {
+    return { recommendation: 'cancel_possible', headline: 'Likely still cancellable — act quickly',
+      steps: [
+        `1. ShipMonk: request a cancel/hold on order ${order.name} (status: ${sm.processing_status || 'unknown'}) BEFORE refunding. If it is already picked/packed this may fail.`,
+        `2. Only after ShipMonk confirms the hold, cancel + refund ${money(order.total_price)} in Shopify.`,
+        '3. Confirm to the customer once both are done.',
+      ],
+      evidence,
+      warnings: [...warnings, 'Time-sensitive: warehouse state can change within minutes. Re-check ShipMonk immediately before acting.'] };
+  }
+
+  // Not in ShipMonk at all and not fulfilled — likely digital-only or not yet routed.
+  return { recommendation: 'cancel_possible_digital', headline: 'No warehouse shipment found — likely cancellable in Shopify alone',
+    steps: [
+      `1. Confirm order ${order.name} has no physical items pending (digital/ebook orders never reach ShipMonk).`,
+      `2. Cancel + refund ${money(order.total_price)} in Shopify.`,
+      '3. If it contains ebook codes, note that already-redeemed codes may not be recoverable — check before refunding in full.',
+    ],
+    evidence,
+    warnings: [...warnings, 'Order was not found in ShipMonk — verify it is genuinely digital-only rather than a sync gap.'] };
+}
+
+// v4.11: gather Shopify + ShipMonk state for a refund/cancel/return request and return a
+// proposed action plan. READ-ONLY — it never mutates either system. Shared by the ticket
+// pipeline and the /diag/propose-order-action test endpoint.
+async function cxProposeOrderAction(ticketData, db, env) {
+  const fullText = `${ticketData.subject || ''}\n${ticketData.firstMessage || ''}`;
+  const orderNumbers = Array.from(new Set((fullText.match(/#?(\d{1,2}-\d{4,7})/g) || []).map(s => s.replace('#', ''))));
+  const found = await cxFindCustomerOrders(ticketData, orderNumbers, db, env);
+  const order = found.order || found.orders?.[0] || found.candidates?.[0] || null;
+  if (!order) {
+    return { ok: false, reason: `no matching Shopify order (lookup: ${found.found_by || 'none'})`, order_numbers_in_message: orderNumbers };
+  }
+  const sm = await cxShipmonkOrderState(env, order.order_number || order.name);
+  const plan = cxBuildOrderActionPlan(order, sm);
+  return {
+    ok: true,
+    order: { name: order.name, order_number: order.order_number, email: order.email, total: order.total_price,
+      financial_status: order.financial_status, fulfillment_status: order.fulfillment_status,
+      cancelled_at: order.cancelled_at, created_at: order.created_at,
+      items: (order.line_items || []).map(li => `${li.quantity}× ${li.title}${li.sku ? ` (${li.sku})` : ''}`) },
+    shipmonk: sm,
+    plan,
+    matched_by: found.found_by,
+  };
+}
+
+// Render the proposal as an internal-note block appended under the AI's suggested reply.
+function cxFormatActionPlan(proposal) {
+  const D = '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━';
+  const p = [];
+  p.push('');
+  p.push(D);
+  p.push('🧾 PROPOSED ACTION (human to execute — the AI has changed nothing)');
+  if (!proposal.ok) {
+    p.push(`   Could not build a plan: ${proposal.reason}`);
+    p.push(D);
+    return p.join('\n');
+  }
+  p.push(`   ${proposal.plan.headline}`);
+  p.push(D);
+  p.push('');
+  for (const s of proposal.plan.steps) p.push('  ' + s);
+  p.push('');
+  p.push('🔎 Evidence used:');
+  for (const e of proposal.plan.evidence) p.push('  • ' + e);
+  if (proposal.plan.warnings?.length) {
+    p.push('');
+    p.push('⚠️  Check before acting:');
+    for (const w of proposal.plan.warnings) p.push('  • ' + w);
+  }
+  p.push(D);
+  return p.join('\n');
+}
+
+// v4.11: verify a draft against the context it was given and STRIP anything unsupported.
+// This is the guard against the agent inventing explanations (e.g. describing a promotion it
+// has no data for). Verification is a different task than writing, so the model isn't under
+// pressure to be helpful/complete — it just checks. Fails OPEN: any error keeps the original
+// draft rather than blocking a reply.
+async function cxVerifyGrounding(env, db, draft, contextBlocks) {
+  const out = { ran: false, stripped: false, unsupported: [], reply: draft };
+  if (!draft || (await cxGetConfig(db, 'grounding_check_enabled')) === false) return out;
+  try {
+    const model = (await cxGetConfig(db, 'classifier_model')) || (await cxGetConfig(db, 'anthropic_model'));
+    const sys = `You are a fact-checker for customer support replies at Nurse In The Making. You are given the CONTEXT an assistant had available and the REPLY it wrote. Find every factual claim in the reply that the context does not support.
+
+Flag a claim as unsupported when it asserts something about: a promotion or discount and how it works, pricing, what a product includes, a policy, order status/history, or WHY something happened — and that specific fact does NOT appear in the context.
+
+Also flag hedged speculation about our business ("usually", "typically", "generally", "should be", "most likely") — hedging means the writer was guessing.
+
+Do NOT flag: greetings, empathy, apologies, tone, offers to check with the team, generic encouragement, or restating what the customer themselves said.
+
+Then produce corrected_reply: the same reply with each unsupported claim REMOVED. Preserve the warm tone, greeting and sign-off exactly. Where a claim is removed, if needed add a brief honest line that we want to confirm the details and are checking with the team. Never add new facts.
+
+Return ONLY valid JSON: {"unsupported":[{"claim":"<exact quote>","why":"<short reason>"}],"corrected_reply":"<full corrected reply>"}
+If everything is supported, return {"unsupported":[],"corrected_reply":"<reply unchanged>"}.`;
+    const user = `CONTEXT AVAILABLE TO THE ASSISTANT:\n\n--- Customer's orders ---\n${contextBlocks.orders || '(none)'}\n\n--- Help Center articles ---\n${(contextBlocks.articles || '(none)').substring(0, 6000)}\n\n--- Product coverage ---\n${contextBlocks.products || '(none)'}\n\n--- Customer's message ---\n${(contextBlocks.customerMessage || '').substring(0, 1500)}\n\nREPLY TO CHECK:\n${draft}`;
+    const resp = await cxCallClaude(env, model, sys, user, 2000);
+    const parsed = cxExtractJson(resp.content);
+    if (!parsed) return out;
+    out.ran = true;
+    out._tokens = resp.tokens;
+    out._cost = resp.cost;
+    const unsupported = Array.isArray(parsed.unsupported) ? parsed.unsupported.filter(u => u && u.claim) : [];
+    out.unsupported = unsupported;
+    // Only swap in the correction when it flagged something AND returned a usable reply.
+    if (unsupported.length && typeof parsed.corrected_reply === 'string' && parsed.corrected_reply.trim().length > 40) {
+      out.reply = parsed.corrected_reply.trim();
+      out.stripped = true;
+    }
+    return out;
+  } catch (err) {
+    console.error('cxVerifyGrounding error:', err);
+    return out; // fail open
+  }
+}
+
 // v4.7: find products whose coverage is relevant to a customer's question. Uses the cheap
 // classifier model to match by meaning (so "cancer" matches a product tagged "oncology").
 // Returns the full coverage_outline for the matched products (capped at `max`).
@@ -2542,13 +2827,15 @@ Your tone/style rules:
 - Use product names exactly as written: "The Complete Nursing School Bundle®", "NurseInTheMaking+", "VitalSource Bookshelf"
 - Link to Help Center articles inline when relevant using markdown: [article title](url)
 
-Response rules:
-- Ground your answer in the Help Center articles below whenever they apply
-- If the articles don't cover the question, give your best general answer but be honest that you'd want a human to follow up
-- If the customer's question is about a specific order problem that requires looking up data you don't have, say so
-- DO NOT invent facts, policies, or product details not in the articles
-- DO NOT promise refunds, exceptions, or account changes — say you'll check with the team
-- If unsure, say so — it's better to suggest a human follow-up than make something up
+Response rules — GROUNDING IS MANDATORY:
+- "Provided context" = the customer's orders, the Help Center articles, and the product coverage shown below. That is the ONLY factual source you have.
+- Every factual claim about promotions, discounts, pricing, what a product includes, policies, order status, or WHY something happened must be directly supported by the provided context.
+- If the context does not support it: DO NOT state it, DO NOT guess, DO NOT reason it out from what seems likely. Say you want to confirm the details and are looping in a teammate.
+- NEVER explain how one of our promotions, bundles, discounts, or policies works unless that explanation appears in the provided context. If a customer says "the site said X", acknowledge what they saw, confirm you'll check exactly what happened, and hand off — do not theorize about what X "usually" means.
+- BANNED when describing anything about NITM (promos, pricing, policy, what's included): "usually", "typically", "generally", "normally", "should be", "most likely", "I believe", "it may be that". If you feel the need to hedge like this, you do not have the facts — omit the claim and hand off instead.
+- DO NOT invent facts, policies, or product details that are not in the provided context.
+- DO NOT promise refunds, exceptions, or account changes — say you'll check with the team.
+- A shorter reply that admits what you need to check is CORRECT and preferred. Being incomplete is fine; being wrong is not.
 
 Product coverage rules (when a "Product coverage" section is provided below):
 - Use it to answer "do your products/materials cover X?" questions — confirm whether the topic is covered and name the specific product it's in
@@ -2616,10 +2903,41 @@ Write the reply as Kristine.`;
         articles: (articles._raw || []).map(a => ({ title: a.title, url: a.url })),
         products: (products._rows || []).map(p => p.name)
       },
+      // Keep the exact context strings so the grounding check verifies against what the
+      // drafter actually saw (not a re-derivation).
+      _context: { orders: ordersContext, articles: articlesContext, products: productsContext, customerMessage: ticketData.firstMessage || '' },
       _tokens: claudeResp.tokens,
       _cost: claudeResp.cost
     };
   });
+
+  // STEP: Grounding check — strip any claim the context can't support (anti-hallucination)
+  const grounding = await tracer.trace('grounding_check', async () => {
+    const g = await cxVerifyGrounding(env, db, response.body, response._context || {});
+    return { ran: g.ran, stripped: g.stripped, unsupported_count: g.unsupported.length, unsupported: g.unsupported, _reply: g.reply, _tokens: g._tokens, _cost: g._cost };
+  });
+  if (grounding.stripped && grounding._reply) {
+    response.body = grounding._reply;
+  }
+  response.data_sources = {
+    ...response.data_sources,
+    grounding: { ran: !!grounding.ran, stripped: !!grounding.stripped, unsupported: grounding.unsupported || [] }
+  };
+
+  // STEP: For refund/cancel/return tickets, work out what SHOULD happen in Shopify + ShipMonk
+  // and propose it for a human to execute. Read-only — nothing is mutated in either system.
+  let actionPlanBlock = '';
+  const actionIntents = ['refund_cancel', 'returns_damaged'];
+  if (actionIntents.includes(intent.intent) && (await cxGetConfig(db, 'order_action_proposals_enabled')) !== false) {
+    const proposal = await tracer.trace('order_action_proposal', async () => {
+      const p = await cxProposeOrderAction(ticketData, db, env);
+      return { ok: p.ok, recommendation: p.plan?.recommendation, order: p.order?.name, shipmonk_source: p.shipmonk?.source, _proposal: p };
+    });
+    if (proposal?._proposal) {
+      actionPlanBlock = cxFormatActionPlan(proposal._proposal);
+      response.data_sources = { ...response.data_sources, action_plan: { recommendation: proposal.recommendation || null, order: proposal.order || null, ok: !!proposal.ok } };
+    }
+  }
 
   // STEP: Format as branded internal note
   const contextLines = [];
@@ -2643,6 +2961,12 @@ Write the reply as Kristine.`;
   if (!articles._raw?.length) {
     warningLines.push('No Help Center articles matched — answer is from AI general knowledge only');
   }
+  if (grounding.stripped) {
+    warningLines.push(`Grounding check removed ${grounding.unsupported_count} unsupported claim(s): ` +
+      (grounding.unsupported || []).map(u => `"${String(u.claim).substring(0, 120)}"`).join(' · '));
+  } else if (grounding.ran) {
+    warningLines.push('Grounding check passed — every claim is supported by the data above');
+  }
 
   const noteBody = cxFormatNote('suggestion', {
     body: response.body,
@@ -2651,7 +2975,7 @@ Write the reply as Kristine.`;
     contextLines,
     articlesUsed: articles._raw || [],
     warningLines
-  });
+  }) + actionPlanBlock;
 
   const fu = !!ticketData.isFollowup;
   const responseId = await cxSaveResponse(db, ticketId, {
@@ -2668,9 +2992,16 @@ Write the reply as Kristine.`;
   // tag, still draft) | auto_reply (send when all gates pass, else fall back to a draft).
   const mode = await cxGetConfig(db, 'mode');
   let decision = { pass: false, reason: 'mode=internal_note' };
+  const groundingSources = (response.data_sources?.orders_found || 0) + (response.data_sources?.articles_used || 0) + (response.data_sources?.products_used || 0);
   if (ticketData.humanActive) {
     // A teammate owns this ticket — NEVER auto-send over them, regardless of mode/gates.
     decision = { pass: false, reason: 'a teammate has replied on this ticket — suggestion only' };
+  } else if (grounding.stripped) {
+    // The draft contained claims we couldn't support. A human reads this one.
+    decision = { pass: false, reason: `grounding check stripped ${grounding.unsupported_count} unsupported claim(s) — needs human review` };
+  } else if (groundingSources === 0) {
+    // No orders, no articles, no product coverage — nothing factual to stand on.
+    decision = { pass: false, reason: 'no grounding sources (no orders/articles/product coverage) — needs human review' };
   } else if (mode === 'shadow' || mode === 'auto_reply') {
     decision = await tracer.trace('auto_reply_decision', async () => ({ ...(await cxAutoReplyDecision(db, intent.intent, response.confidence)), mode }));
   }
@@ -2803,7 +3134,22 @@ async function cxFetchZendeskTicket(ticketId, db, env) {
   const commentsResp = await fetch(`https://${subdomain}.zendesk.com/api/v2/tickets/${ticketId}/comments.json`, { headers: { Authorization: `Basic ${auth}` } });
   const { comments = [] } = commentsResp.ok ? await commentsResp.json() : { comments: [] };
   const supportStaffIds = await cxGetConfig(db, 'support_staff_ids');
-  const customerComments = comments.filter(c => c.public && !supportStaffIds.includes(c.author_id));
+  const botId = Number(await cxGetConfig(db, 'bot_author_id')) || null;
+  // Prefer "authored by the requester" over the hardcoded staff allowlist — that list goes
+  // stale as agents come and go, and when it misses one, OUR outbound email was being treated
+  // as the customer's message.
+  let customerComments = ticket.requester_id
+    ? comments.filter(c => c.public && c.author_id === ticket.requester_id)
+    : [];
+  // Messaging/social tickets (Instagram, chat) attribute the customer's words to a synthetic
+  // author (-1) rather than the requester, so the strict match finds nothing. Fall back to
+  // "public and not us" so those still get a real first message instead of the
+  // "Conversation with X" placeholder.
+  if (!customerComments.length) {
+    customerComments = comments.filter(c => c.public
+      && !supportStaffIds.includes(c.author_id)
+      && (botId ? c.author_id !== botId : true));
+  }
   // For Messaging tickets, ticket.description is often a placeholder like "Conversation with [name]".
   // Always prefer the first real customer comment if one exists.
   const firstCustomerMessage = customerComments[0]?.plain_body || ticket.description || null;
@@ -3601,6 +3947,57 @@ async function handleCxAgentAPI(request, env, path) {
     // Mirrors captureHumanReply WITHOUT inserting — shows exactly why a reply did or
     // didn't get captured (ticket-in-DB? which comments are public? which author_ids
     // match support_staff_ids?). If no ticket given, picks the most recent drafted ticket.
+    // GET /cx-agent/api/diag/propose-order-action?order=<number>  (or ?email=<addr>)
+    // Runs the full cancel/refund/return decision engine against a real order — Shopify +
+    // ShipMonk reads only, NO ticket, NO Zendesk write, NOTHING mutated. This is the way to
+    // spot-check whether the agent would make the right call before trusting it.
+    if (path === '/cx-agent/api/diag/propose-order-action' && request.method === 'GET') {
+      const url = new URL(request.url);
+      const orderNum = url.searchParams.get('order');
+      const email = url.searchParams.get('email');
+      if (!orderNum && !email) return new Response(JSON.stringify({ error: 'pass ?order=<order number> or ?email=<customer email>' }), { status: 400, headers: cors });
+      // Synthesize the minimum ticketData the engine needs.
+      const fakeTicket = {
+        subject: orderNum ? `order ${orderNum}` : 'refund request',
+        firstMessage: orderNum ? `I want to cancel my order ${orderNum}` : 'I want to cancel my order',
+        customerEmail: email || null,
+        ticket: {},
+      };
+      const proposal = await cxProposeOrderAction(fakeTicket, db, env);
+      return new Response(JSON.stringify({
+        read_only: true,
+        note: 'Nothing was changed in Shopify or ShipMonk. This is what the agent would propose.',
+        ...proposal,
+        rendered_note: proposal.ok ? cxFormatActionPlan(proposal) : undefined,
+      }, null, 2), { headers: cors });
+    }
+
+    // GET /cx-agent/api/diag/top-noise-senders — senders whose tickets keep classifying as
+    // noise/spam. Use it to populate ignored_senders with the real repeat offenders.
+    if (path === '/cx-agent/api/diag/top-noise-senders' && request.method === 'GET') {
+      const rows = (await db.prepare(`
+        SELECT customer_email,
+               COUNT(*) AS total,
+               SUM(CASE WHEN classified_intent = 'noise' THEN 1 ELSE 0 END) AS noise,
+               MAX(received_at) AS last_seen
+        FROM agent_tickets
+        WHERE customer_email IS NOT NULL AND customer_email != ''
+        GROUP BY customer_email
+        HAVING noise >= 2
+        ORDER BY noise DESC LIMIT 40
+      `).all()).results || [];
+      const domains = {};
+      for (const r of rows) {
+        const d = '@' + String(r.customer_email).split('@')[1];
+        domains[d] = (domains[d] || 0) + r.noise;
+      }
+      return new Response(JSON.stringify({
+        note: 'Senders with 2+ noise-classified tickets. Add the ones you never want processed to the ignored_senders config (exact address, or "@domain" to block the whole domain).',
+        senders: rows,
+        by_domain: Object.entries(domains).sort((a, b) => b[1] - a[1]).map(([domain, noise]) => ({ domain, noise })),
+      }, null, 2), { headers: cors });
+    }
+
     // GET /cx-agent/api/diag/recent — one-page health view: recent tickets (with turn
     // claims), recent drafts, and recent follow-up traces. For "replies aren't running".
     if (path === '/cx-agent/api/diag/recent' && request.method === 'GET') {
