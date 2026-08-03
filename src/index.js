@@ -4953,6 +4953,41 @@ async function handleCxAgentAPI(request, env, path) {
       return new Response(JSON.stringify({ dry_run: dry, examined: rows.length, results }, null, 2), { headers: cors });
     }
 
+    // GET /cx-agent/api/diag/shopify-auth
+    // Is the Shopify token valid, and does it have the scopes the write actions need?
+    // Read-only: one REST shop call + one REST scope call. Reports the raw status so an
+    // expired/mismatched token is obvious instead of surfacing as "no orders found".
+    if (path === '/cx-agent/api/diag/shopify-auth' && request.method === 'GET') {
+      const shopDomain = await cxGetConfig(db, 'shopify_store_domain');
+      const hdr = { 'X-Shopify-Access-Token': env.SHOPIFY_ACCESS_TOKEN || '' };
+      const probe = async (p) => {
+        try {
+          const r = await fetch(`https://${shopDomain}${p}`, { headers: hdr });
+          const body = await r.text();
+          let json = null; try { json = JSON.parse(body); } catch {}
+          return { status: r.status, ok: r.ok, json, body: json ? undefined : body.slice(0, 300) };
+        } catch (e) { return { error: e.message }; }
+      };
+      const shop = await probe('/admin/api/2024-01/shop.json');
+      const scopesRes = await probe('/admin/oauth/access_scopes.json');
+      const scopes = (scopesRes.json?.access_scopes || []).map(s => s.handle).sort();
+      const need = ['write_orders'];
+      const missing = need.filter(s => !scopes.includes(s));
+      return new Response(JSON.stringify({
+        token_present: !!env.SHOPIFY_ACCESS_TOKEN,
+        token_valid: shop.ok === true,
+        shop: shop.json?.shop?.myshopify_domain || null,
+        shop_probe_status: shop.status ?? shop.error,
+        scopes,
+        required_for_writes: need,
+        missing_scopes: missing,
+        verdict: !env.SHOPIFY_ACCESS_TOKEN ? 'NO TOKEN configured'
+          : shop.ok !== true ? `TOKEN REJECTED by Shopify (HTTP ${shop.status}) — if you regenerated it in the Shopify app, update the Worker secret: npx wrangler secret put SHOPIFY_ACCESS_TOKEN`
+          : missing.length ? `Token valid but MISSING scope(s): ${missing.join(', ')} — add them to the app and regenerate the token`
+          : 'READY — token valid and write_orders granted',
+      }, null, 2), { headers: cors });
+    }
+
     // GET /cx-agent/api/diag/raw-ticket?ticket=<zid> — dump what Zendesk actually returns for
     // a ticket (ticket + comments + audits), untruncated. Used to work out where Messaging /
     // Instagram / Facebook message content actually lives.
@@ -6051,7 +6086,14 @@ async function shopifyGraphQL(env, shopDomain, query, variables, { maxRetries = 
       continue;
     }
 
-    const errs = json.errors || [];
+    // Shopify returns `errors` as an ARRAY for GraphQL errors but as a STRING for auth
+    // failures (e.g. "[API] Invalid API key or access token"), which used to crash the error
+    // handler itself with "errs.some is not a function" and hide the real cause.
+    const rawErrs = json.errors;
+    if (typeof rawErrs === "string") {
+      throw new Error(`Shopify GraphQL auth/request error: ${rawErrs}`);
+    }
+    const errs = Array.isArray(rawErrs) ? rawErrs : (rawErrs ? [rawErrs] : []);
     // THROTTLED and Shopify-side INTERNAL_SERVER_ERROR are both transient — back off + retry.
     const throttled = errs.some((e) => e?.extensions?.code === "THROTTLED");
     const serverErr = errs.some((e) => e?.extensions?.code === "INTERNAL_SERVER_ERROR");
