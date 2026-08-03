@@ -4527,7 +4527,50 @@ async function handleCxAgentAPI(request, env, path) {
       }, null, 2), { headers: cors });
     }
 
-    // POST /cx-agent/api/diag/reprocess-messaging?limit=25[&dry=1]
+    // GET /cx-agent/api/diag/triage-messaging?limit=100&before_id=<cursor>
+    // READ-ONLY triage of the pre-fix Messaging backlog: fetch each ticket's real transcript
+    // and sort it into "substantive" (an actual question/request worth re-running) vs
+    // "trivial" (emoji reaction, sticker, attachment-only) vs "empty". Nothing is written and
+    // no Zendesk notes are posted — this exists so we only reprocess what matters.
+    if (path === '/cx-agent/api/diag/triage-messaging' && request.method === 'GET') {
+      const url = new URL(request.url);
+      const limit = Math.min(Math.max(parseInt(url.searchParams.get('limit') || '100'), 1), 200);
+      const beforeId = parseInt(url.searchParams.get('before_id') || '0') || Number.MAX_SAFE_INTEGER;
+      const rows = (await db.prepare(`
+        SELECT id, zendesk_ticket_id, channel, classified_intent FROM agent_tickets
+        WHERE (channel IN ('instagram_dm','native_messaging','chat') OR channel LIKE 'sunshine_conversations%')
+          AND (first_customer_message IS NULL OR first_customer_message LIKE 'Conversation with %')
+          AND status != 'ignored' AND id < ?
+        ORDER BY id DESC LIMIT ?
+      `).bind(beforeId, limit).all()).results || [];
+
+      const substantive = [], counts = { substantive: 0, trivial: 0, empty: 0, error: 0 };
+      let cursor = null;
+      for (const row of rows) {
+        cursor = row.id;
+        try {
+          const td = await cxFetchZendeskTicket(row.zendesk_ticket_id, db, env);
+          const msg = String(td?.firstMessage || '').trim();
+          const isPlaceholder = !msg || /^Conversation with /i.test(msg);
+          // Strip emoji/punctuation/whitespace to see if any real words remain.
+          const wordy = msg.replace(/[\p{Extended_Pictographic}\p{Emoji_Presentation}\s\p{P}\p{S}]/gu, '');
+          // Zendesk/Meta system artifacts are not customer messages.
+          const artifact = /^(Error:|Attachment sent by the user was redacted|Unsupported attachment|\[sent an attachment)/i.test(msg)
+            || /file type .* not accepted/i.test(msg);
+          if (isPlaceholder) { counts.empty++; continue; }
+          if (artifact || wordy.length < 12) { counts.trivial++; continue; }
+          counts.substantive++;
+          substantive.push({ ticket_id: row.id, zendesk_ticket_id: row.zendesk_ticket_id, was: row.classified_intent, message: msg.slice(0, 200) });
+        } catch (e) { counts.error++; }
+      }
+      return new Response(JSON.stringify({
+        read_only: true, examined: rows.length, counts,
+        next_cursor: rows.length === limit ? cursor : null,
+        substantive,
+      }, null, 2), { headers: cors });
+    }
+
+    // POST /cx-agent/api/diag/reprocess-messaging?limit=25[&dry=1][&ids=1,2,3]
     // Messaging/DM tickets processed before v4.13 were classified on the "Conversation with X"
     // placeholder and almost always came out as noise. This re-runs them against the real
     // transcript. dry=1 previews what would change without touching anything.
@@ -4535,14 +4578,22 @@ async function handleCxAgentAPI(request, env, path) {
       const url = new URL(request.url);
       const limit = Math.min(Math.max(parseInt(url.searchParams.get('limit') || '25'), 1), 100);
       const dry = url.searchParams.get('dry') === '1';
-      const rows = (await db.prepare(`
-        SELECT id, zendesk_ticket_id, channel, classified_intent, first_customer_message
-        FROM agent_tickets
-        WHERE (channel IN ('instagram_dm','native_messaging','chat') OR channel LIKE 'sunshine_conversations%')
-          AND (first_customer_message IS NULL OR first_customer_message LIKE 'Conversation with %')
-          AND status != 'ignored'
-        ORDER BY id DESC LIMIT ?
-      `).bind(limit).all()).results || [];
+      // ids= lets you reprocess ONLY specific tickets — e.g. just the "substantive" ones that
+      // /diag/triage-messaging found, instead of every placeholder ticket.
+      const ids = (url.searchParams.get('ids') || '').split(',').map(s => parseInt(s.trim())).filter(Boolean).slice(0, 100);
+      const rows = ids.length
+        ? (await db.prepare(
+            `SELECT id, zendesk_ticket_id, channel, classified_intent, first_customer_message
+             FROM agent_tickets WHERE id IN (${ids.map(() => '?').join(',')})`
+          ).bind(...ids).all()).results || []
+        : (await db.prepare(`
+            SELECT id, zendesk_ticket_id, channel, classified_intent, first_customer_message
+            FROM agent_tickets
+            WHERE (channel IN ('instagram_dm','native_messaging','chat') OR channel LIKE 'sunshine_conversations%')
+              AND (first_customer_message IS NULL OR first_customer_message LIKE 'Conversation with %')
+              AND status != 'ignored'
+            ORDER BY id DESC LIMIT ?
+          `).bind(limit).all()).results || [];
 
       const results = [];
       for (const row of rows) {
