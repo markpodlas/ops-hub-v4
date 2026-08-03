@@ -1220,24 +1220,7 @@ async function openThread(ticketId) {
         </div>
       </div>`;
 
-    // DM/Messaging tickets: show the real Instagram/Facebook conversation, which lives in
-    // Zendesk's chat_transcript comments rather than the ticket body.
-    const dmBlock = (d.dm && d.dm.messages && d.dm.messages.length) ? `
-      <div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:14px;margin-bottom:16px">
-        <div style="font-size:12px;color:var(--text-muted);margin-bottom:10px">💬 <b>${escape(t.channel || 'Messaging')} conversation</b>${d.dm.customer_name ? ' with ' + escape(d.dm.customer_name) : ''}</div>
-        ${d.dm.messages.map(m => `
-          <div style="display:flex;justify-content:${m.fromCustomer ? 'flex-start' : 'flex-end'};margin-bottom:8px">
-            <div style="max-width:78%">
-              <div style="font-size:11px;color:var(--text-dim);margin-bottom:3px;${m.fromCustomer ? '' : 'text-align:right'}">${escape(m.sender || (m.fromCustomer ? 'Customer' : 'Team'))}${m.time ? ' · ' + escape(m.time) : ''}</div>
-              <div style="${BUBBLE};background:${m.fromCustomer ? 'var(--surface2)' : 'rgba(48,164,108,0.10)'};border:1px solid ${m.fromCustomer ? 'var(--border)' : 'var(--green,#30a46c)'}">${escape(m.text)}</div>
-            </div>
-          </div>`).join('')}
-      </div>` : '';
-
-    const thread = turns.map((turn, i) => renderThreadTurn(turn, i, turns.length)).join('');
-    const extras = (d.unlinked_replies || []).length
-      ? `<div style="margin-top:12px">${d.unlinked_replies.map(r => bubbleTeam(r)).join('')}</div>` : '';
-    container.innerHTML = header + dmBlock + thread + extras;
+    container.innerHTML = header + renderTimeline(d, t, turns);
   } catch (e) {
     container.innerHTML = `<button onclick="closeThread()" style="font-size:12px;padding:5px 12px;background:transparent;border:1px solid var(--border);color:var(--text-muted);border-radius:4px;cursor:pointer">← All tickets</button>
       <div class="loading">Could not load: ${escape(e.message)}</div>`;
@@ -1293,11 +1276,88 @@ function bubbleTeam(r) {
     </div>`;
 }
 
+// ONE chronological timeline, like Zendesk: customer messages, AI internal-note drafts, and
+// team replies interleaved in time order — each message appearing exactly once. (Previously
+// the customer's text was repeated inside every turn AND in a separate DM block.)
+function renderTimeline(d, t, turns) {
+  const ms = (s) => { const v = Date.parse(String(s || '').replace(' ', 'T') + (String(s || '').includes('Z') ? '' : 'Z')); return isNaN(v) ? 0 : v; };
+  const events = [];
+  const dmMsgs = (d.dm && d.dm.messages) || [];
+
+  // 1) The real conversation. For DM/Messaging it comes from the parsed chat transcript;
+  //    for email it's each turn's customer message (deduped — reprocessing can repeat it).
+  if (dmMsgs.length) {
+    // Two traps here: a transcript comment's created_at is when Zendesk WROTE the transcript
+    // (after the chat ended), and the "(HH:MM:SS)" in each line is in the ACCOUNT's timezone
+    // while our DB timestamps are UTC. So don't do timezone math — anchor the first message to
+    // ticket creation (they're the same event) and keep each message's offset from it.
+    const secs = (hms) => { const p = String(hms || '').split(':').map(Number); return (p.length >= 2 && !p.some(isNaN)) ? (p[0] * 3600 + p[1] * 60 + (p[2] || 0)) : null; };
+    const anchorMs = ms(t.received_at);
+    const firstSecs = secs(dmMsgs.find(m => m.time)?.time);
+    for (const m of dmMsgs) {
+      let at = ms(m.created_at);
+      const s = secs(m.time);
+      if (anchorMs && firstSecs != null && s != null) {
+        let delta = s - firstSecs;
+        if (delta < -12 * 3600) delta += 24 * 3600; // conversation rolled past midnight
+        at = anchorMs + delta * 1000;
+      }
+      events.push({ at, kind: m.fromCustomer ? 'customer' : 'team',
+        sender: m.sender, time: m.time, text: m.text, dm: true });
+    }
+  } else {
+    const seenMsg = new Set();
+    for (const turn of turns) {
+      const txt = (turn.customer_message || '').trim();
+      if (!txt) continue;
+      const key = txt.slice(0, 300);
+      if (seenMsg.has(key)) continue;
+      seenMsg.add(key);
+      events.push({ at: ms(turn.drafted_at) - 1000, kind: 'customer', text: txt });
+    }
+  }
+
+  // 2) The AI drafts (reviewable) and 3) what the team actually sent.
+  let n = 0;
+  for (const turn of turns) {
+    events.push({ at: ms(turn.drafted_at), kind: 'ai', turn, index: ++n });
+    if (turn.human_reply) events.push({ at: ms(turn.reply_created_at) || ms(turn.drafted_at) + 1000, kind: 'team', reply: turn });
+  }
+  for (const r of (d.unlinked_replies || [])) {
+    events.push({ at: ms(r.reply_created_at), kind: 'team', reply: r });
+  }
+
+  events.sort((a, b) => a.at - b.at);
+
+  const totalAi = n;
+  return events.map(e => {
+    if (e.kind === 'customer') {
+      return e.dm
+        ? dmBubble(e, true)
+        : bubbleCustomer(e.text, null);
+    }
+    if (e.kind === 'team') {
+      return e.dm ? dmBubble(e, false) : bubbleTeam(e.reply);
+    }
+    return renderThreadTurn(e.turn, e.index - 1, totalAi);
+  }).join('');
+}
+
+function dmBubble(e, fromCustomer) {
+  return `
+    <div style="display:flex;justify-content:${fromCustomer ? 'flex-start' : 'flex-end'};margin-bottom:10px">
+      <div style="max-width:78%">
+        <div style="font-size:11px;color:var(--text-muted);margin-bottom:3px;${fromCustomer ? '' : 'text-align:right'}">${fromCustomer ? '👤 ' : '✅ '}<b>${escape(e.sender || (fromCustomer ? 'Customer' : 'Team'))}</b>${e.time ? ' · ' + escape(e.time) : ''}</div>
+        <div style="${BUBBLE};background:${fromCustomer ? 'var(--surface)' : 'rgba(48,164,108,0.10)'};border:1px solid ${fromCustomer ? 'var(--border)' : 'var(--green,#30a46c)'}">${escape(e.text)}</div>
+      </div>
+    </div>`;
+}
+
 // The AI's draft — styled like a Zendesk internal note, with the review controls attached.
 function renderThreadTurn(turn, idx, total) {
   const rid = turn.reply_id;
   const needsReview = !turn.rating;
-  const label = turn.is_followup ? `Follow-up #${turn.turn_number}` : 'Initial message';
+  const label = total > 1 ? `AI draft ${idx + 1} of ${total}` : 'AI draft';
   const ratingPill = turn.rating
     ? `<span class="pill ${ratingClass(turn.rating)}" style="font-size:11px">${ratingLabel(turn.rating)}</span>`
     : '<span class="pill pill-warn" style="font-size:11px">needs review</span>';
@@ -1324,14 +1384,12 @@ function renderThreadTurn(turn, idx, total) {
     </div>`;
 
   return `
-    <div id="card-${rid || 'r' + turn.response_id}" style="border-left:3px solid ${needsReview ? 'var(--amber,#f5a623)' : 'var(--green,#30a46c)'};padding-left:14px;margin-bottom:22px">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
-        <span class="pill pill-neutral" style="font-size:11px">${label} · ${idx + 1} of ${total}</span>
+    <div id="card-${rid || 'r' + turn.response_id}" style="border-left:3px solid ${needsReview ? 'var(--amber,#f5a623)' : 'var(--green,#30a46c)'};padding-left:14px;margin:16px 0 22px">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+        <span style="font-size:11px;color:var(--text-muted)">🤖 <b>${label}</b> — internal note, never sent${turn.drafted_at ? ' · ' + formatDate(turn.drafted_at) : ''}</span>
         ${ratingPill}
       </div>
-      ${bubbleCustomer(turn.customer_message, null)}
       <div style="margin-bottom:12px">
-        <div style="font-size:11px;color:var(--text-muted);margin-bottom:4px">🤖 <b>AI draft</b> (posted as an internal note)${turn.drafted_at ? ' · ' + formatDate(turn.drafted_at) : ''}</div>
         <div style="${BUBBLE};background:rgba(245,166,35,0.07);border:1px solid var(--amber,#f5a623)">${escape(turn.draft_body || '(no draft)')}</div>
         ${renderContextUsed(turn.data_sources)}
       </div>
