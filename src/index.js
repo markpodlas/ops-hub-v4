@@ -102,6 +102,80 @@ async function handleShipFusionAPI(request, env) {
 // Auth: header `Api-Key: <key>`, base /v1/integrations, storeId on most calls.
 const SHIPMONK_BASE = "https://api.shipmonk.com/v1/integrations";
 
+// ============================================================================
+// Shopify Admin API token resolution.
+// Apps created in Shopify's Dev Dashboard (which is now the only way to create
+// them) have NO static token — you mint a short-lived one with the client
+// credentials grant, valid 24h. Legacy admin-created apps still hand out a
+// static shpat_ token, so both paths are supported.
+// ============================================================================
+let _shopifyTok = null; // per-isolate cache: { token, expiresAt, scope }
+
+async function shopifyToken(env) {
+  const stat = String(env.SHOPIFY_ACCESS_TOKEN || '');
+  // Legacy static token (shpat_) wins when present — no minting needed.
+  if (stat.startsWith('shpat_')) return stat;
+
+  const now = Date.now();
+  if (_shopifyTok && _shopifyTok.token && _shopifyTok.expiresAt > now + 60_000) return _shopifyTok.token;
+
+  // Cross-isolate cache so we don't mint on every cold start.
+  try {
+    const row = await env.CX_AGENT_DB?.prepare("SELECT value FROM agent_config WHERE key = 'shopify_token_cache'").first();
+    if (row?.value) {
+      const c = JSON.parse(row.value);
+      if (c?.token && c.expiresAt > now + 60_000) { _shopifyTok = c; return c.token; }
+    }
+  } catch {}
+
+  if (!env.SHOPIFY_CLIENT_ID || !env.SHOPIFY_CLIENT_SECRET) {
+    // Nothing to mint with — fall back to whatever is configured so callers get
+    // Shopify's own error rather than a confusing undefined header.
+    return stat;
+  }
+
+  const shopDomain = (await env.CX_AGENT_DB?.prepare("SELECT value FROM agent_config WHERE key='shopify_store_domain'").first())?.value
+    || 'nurseinthemaking.myshopify.com';
+  const body = new URLSearchParams({
+    grant_type: 'client_credentials',
+    client_id: env.SHOPIFY_CLIENT_ID,
+    client_secret: env.SHOPIFY_CLIENT_SECRET,
+  });
+  const res = await fetch(`https://${shopDomain}/admin/oauth/access_token`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: body.toString(),
+  });
+  const text = await res.text();
+  if (!res.ok) throw new Error(`Shopify client_credentials failed ${res.status}: ${text.slice(0, 300)}`);
+  let json = null; try { json = JSON.parse(text); } catch {}
+  if (!json?.access_token) throw new Error(`Shopify client_credentials returned no access_token: ${text.slice(0, 200)}`);
+
+  const cache = {
+    token: json.access_token,
+    scope: json.scope || '',
+    // expires_in is ~86399s; refresh a little early.
+    expiresAt: now + (Number(json.expires_in || 86399) - 300) * 1000,
+  };
+  _shopifyTok = cache;
+  try {
+    await env.CX_AGENT_DB?.prepare(
+      "INSERT INTO agent_config (key, value, value_type, description) VALUES ('shopify_token_cache', ?, 'json', 'Cached Shopify client-credentials token (managed automatically)') ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')"
+    ).bind(JSON.stringify(cache)).run();
+  } catch {}
+  return cache.token;
+}
+
+// Convenience: the auth header every Shopify REST call needs.
+async function shopifyAuthHeaders(env, extra = {}) {
+  return { 'X-Shopify-Access-Token': await shopifyToken(env), ...extra };
+}
+
+// Can we authenticate to Shopify at all — either a static token or client credentials?
+function hasShopifyAuth(env) {
+  return !!(env.SHOPIFY_ACCESS_TOKEN || (env.SHOPIFY_CLIENT_ID && env.SHOPIFY_CLIENT_SECRET));
+}
+
 // ShipMonk "MoneyOutput" fields can be a number or an object {amount|value|total}.
 function smMoney(v) {
   if (v == null) return 0;
@@ -3017,7 +3091,7 @@ async function cxShopifyUpdateAddress(env, db, orderId, address) {
   } } };
   const resp = await fetch(`https://${shopDomain}/admin/api/2024-01/orders/${orderId}.json`, {
     method: 'PUT',
-    headers: { 'X-Shopify-Access-Token': env.SHOPIFY_ACCESS_TOKEN, 'Content-Type': 'application/json' },
+    headers: { 'X-Shopify-Access-Token': await shopifyToken(env), 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   });
   const text = await resp.text();
@@ -3176,7 +3250,7 @@ async function cxDraftGeneralSuggestion(ticketId, ticketData, intent, db, env, t
     try {
       const resp = await fetch(
         `https://${shopDomain}/admin/api/2024-01/orders.json?email=${encodeURIComponent(ticketData.customerEmail)}&status=any&limit=5`,
-        { headers: { 'X-Shopify-Access-Token': env.SHOPIFY_ACCESS_TOKEN } }
+        { headers: { 'X-Shopify-Access-Token': await shopifyToken(env) } }
       );
       if (!resp.ok) return { orders: [], note: `api ${resp.status}` };
       const { orders = [] } = await resp.json();
@@ -3848,7 +3922,7 @@ async function cxAutoReplyDecision(db, intentName, draftConfidence) {
 async function cxFindCustomerOrders(ticketData, orderNumbersFound, db, env) {
   const shopDomain = await cxGetConfig(db, 'shopify_store_domain');
   const maxAgeDays = await cxGetConfig(db, 'max_order_age_days');
-  const authHeaders = { 'X-Shopify-Access-Token': env.SHOPIFY_ACCESS_TOKEN };
+  const authHeaders = { 'X-Shopify-Access-Token': await shopifyToken(env) };
 
   // Path A: Explicit order numbers in ticket — look up each one
   if (orderNumbersFound && orderNumbersFound.length > 0) {
@@ -3909,7 +3983,7 @@ async function cxFindCustomerOrders(ticketData, orderNumbersFound, db, env) {
 
 async function cxFetchOrderMetafields(orderId, db, env) {
   const shopDomain = await cxGetConfig(db, 'shopify_store_domain');
-  const resp = await fetch(`https://${shopDomain}/admin/api/2024-01/orders/${orderId}/metafields.json`, { headers: { 'X-Shopify-Access-Token': env.SHOPIFY_ACCESS_TOKEN } });
+  const resp = await fetch(`https://${shopDomain}/admin/api/2024-01/orders/${orderId}/metafields.json`, { headers: { 'X-Shopify-Access-Token': await shopifyToken(env) } });
   if (!resp.ok) return [];
   const { metafields = [] } = await resp.json();
   return metafields;
@@ -4959,44 +5033,63 @@ async function handleCxAgentAPI(request, env, path) {
     // expired/mismatched token is obvious instead of surfacing as "no orders found".
     if (path === '/cx-agent/api/diag/shopify-auth' && request.method === 'GET') {
       const shopDomain = await cxGetConfig(db, 'shopify_store_domain');
-      const hdr = { 'X-Shopify-Access-Token': env.SHOPIFY_ACCESS_TOKEN || '' };
+      // Resolve a token the same way the rest of the app does: static shpat_ if configured,
+      // otherwise mint one with the client credentials grant.
+      let resolved = null, authMode = null, mintError = null;
+      const stat = String(env.SHOPIFY_ACCESS_TOKEN || '');
+      try {
+        resolved = await shopifyToken(env);
+        authMode = stat.startsWith('shpat_') ? 'static shpat_ token'
+          : (env.SHOPIFY_CLIENT_ID && env.SHOPIFY_CLIENT_SECRET) ? 'client_credentials grant (24h, auto-minted)'
+          : 'static token (unrecognised format)';
+      } catch (e) { mintError = e.message; authMode = 'client_credentials grant (FAILED)'; }
+
       const probe = async (p) => {
+        if (!resolved) return { skipped: 'no token resolved' };
         try {
-          const r = await fetch(`https://${shopDomain}${p}`, { headers: hdr });
+          const r = await fetch(`https://${shopDomain}${p}`, { headers: { 'X-Shopify-Access-Token': resolved } });
           const body = await r.text();
           let json = null; try { json = JSON.parse(body); } catch {}
           return { status: r.status, ok: r.ok, json, body: json ? undefined : body.slice(0, 300) };
         } catch (e) { return { error: e.message }; }
       };
-      // Identify the KIND of credential stored without revealing it — pasting the Client ID or
-      // Client Secret instead of the Admin API access token is an easy and invisible mistake.
-      const tok = String(env.SHOPIFY_ACCESS_TOKEN || '');
-      const shape = !tok ? 'empty'
-        : tok.startsWith('shpat_') ? 'looks like an Admin API access token (shpat_…) ✓'
-        : tok.startsWith('shpss_') ? 'this is an API SECRET KEY (shpss_…) — wrong credential, you need the shpat_ Admin API access token'
-        : tok.startsWith('shpca_') ? 'this is a custom-app token prefix (shpca_…) — usually wrong for Admin API'
-        : /^[0-9a-f]{32}$/i.test(tok) ? 'this is a 32-char hex value — that is the API key / Client ID or Client Secret, NOT the Admin API access token'
-        : 'unrecognised format — expected an Admin API access token starting with shpat_';
       const shop = await probe('/admin/api/2024-01/shop.json');
       const scopesRes = await probe('/admin/oauth/access_scopes.json');
       const scopes = (scopesRes.json?.access_scopes || []).map(s => s.handle).sort();
       const need = ['write_orders'];
       const missing = need.filter(s => !scopes.includes(s));
+      // Prove the minted token works with REST orders too (docs only promise GraphQL).
+      const orders = await probe('/admin/api/2024-01/orders.json?limit=1&status=any');
+
+      // Shape-only diagnostics for the client credentials (never the values). A Shopify
+      // Client ID is 32 hex chars; the secret starts with shpss_.
+      const cid = String(env.SHOPIFY_CLIENT_ID || ''), csec = String(env.SHOPIFY_CLIENT_SECRET || '');
+      const credCheck = {
+        client_id_length: cid.length,
+        client_id_shape: !cid ? 'MISSING' : /^[0-9a-f]{32}$/i.test(cid) ? 'looks like a Shopify Client ID (32 hex) ✓' : 'unexpected format for a Client ID',
+        client_secret_length: csec.length,
+        client_secret_shape: !csec ? 'MISSING' : csec.startsWith('shpss_') ? 'looks like a Shopify client secret (shpss_…) ✓' : 'unexpected format — expected shpss_…',
+      };
       return new Response(JSON.stringify({
-        token_present: !!env.SHOPIFY_ACCESS_TOKEN,
-        // Diagnostic only — never the value itself.
-        token_shape: shape,
-        token_length: tok.length,
+        auth_mode: authMode,
+        client_credentials_configured: !!(env.SHOPIFY_CLIENT_ID && env.SHOPIFY_CLIENT_SECRET),
+        credential_check: credCheck,
+        static_token_configured: !!stat,
+        mint_error: mintError ? String(mintError).replace(/<[\s\S]*$/, '(HTML error page truncated)') : null,
         token_valid: shop.ok === true,
+        rest_orders_ok: orders.ok === true,
+        rest_orders_status: orders.status ?? orders.error ?? orders.skipped,
         shop: shop.json?.shop?.myshopify_domain || null,
-        shop_probe_status: shop.status ?? shop.error,
+        shop_probe_status: shop.status ?? shop.error ?? shop.skipped,
         scopes,
         required_for_writes: need,
         missing_scopes: missing,
-        verdict: !env.SHOPIFY_ACCESS_TOKEN ? 'NO TOKEN configured'
-          : shop.ok !== true ? `TOKEN REJECTED by Shopify (HTTP ${shop.status}) — if you regenerated it in the Shopify app, update the Worker secret: npx wrangler secret put SHOPIFY_ACCESS_TOKEN`
-          : missing.length ? `Token valid but MISSING scope(s): ${missing.join(', ')} — add them to the app and regenerate the token`
-          : 'READY — token valid and write_orders granted',
+        verdict: mintError ? `COULD NOT MINT a token: ${mintError}`
+          : !resolved ? 'NO Shopify credentials configured'
+          : shop.ok !== true ? `TOKEN REJECTED by Shopify (HTTP ${shop.status})`
+          : missing.length ? `Token valid but MISSING scope(s): ${missing.join(', ')} — add them in the Dev Dashboard app and reinstall`
+          : orders.ok !== true ? `Token valid and scoped, but REST orders returned ${orders.status} — writes use REST, so investigate`
+          : 'READY — token valid, write_orders granted, REST orders reachable',
       }, null, 2), { headers: cors });
     }
 
@@ -5833,7 +5926,7 @@ async function handleIcpAPI(request, env, path) {
     }
 
     if (path === "/icp/api/affinity/build" && request.method === "POST") {
-      if (!env.SHOPIFY_ACCESS_TOKEN) {
+      if (!hasShopifyAuth(env)) {
         return new Response(JSON.stringify({ error: "SHOPIFY_ACCESS_TOKEN not configured" }), { status: 500, headers: cors });
       }
       const reqUrl = new URL(request.url);
@@ -5941,7 +6034,7 @@ async function handleIcpAPI(request, env, path) {
     }
 
     if (path === "/icp/api/sync/stage-metafields" && request.method === "POST") {
-      if (!env.SHOPIFY_ACCESS_TOKEN) {
+      if (!hasShopifyAuth(env)) {
         return new Response(JSON.stringify({ error: "SHOPIFY_ACCESS_TOKEN not configured" }), { status: 500, headers: cors });
       }
       const reqUrl = new URL(request.url);
@@ -5957,7 +6050,7 @@ async function handleIcpAPI(request, env, path) {
 
     if (path === "/icp/api/sync/stage-metafields/scopes" && request.method === "GET") {
       // Diagnostic: what scopes does the token the Worker actually holds have?
-      if (!env.SHOPIFY_ACCESS_TOKEN) {
+      if (!hasShopifyAuth(env)) {
         return new Response(JSON.stringify({ error: "SHOPIFY_ACCESS_TOKEN not configured" }), { status: 500, headers: cors });
       }
       const shopDomain = await shopifyStoreDomain(env);
@@ -6073,7 +6166,7 @@ async function shopifyGraphQL(env, shopDomain, query, variables, { maxRetries = 
     const res = await fetch(`https://${shopDomain}/admin/api/${SHOPIFY_GQL_VERSION}/graphql.json`, {
       method: "POST",
       headers: {
-        "X-Shopify-Access-Token": env.SHOPIFY_ACCESS_TOKEN,
+        "X-Shopify-Access-Token": await shopifyToken(env),
         "Content-Type": "application/json",
       },
       body: JSON.stringify({ query, variables }),
@@ -6357,7 +6450,7 @@ async function syncStageMetafields(env, { restart = false, full = false, pagesPe
 // A failure (e.g. a missing Shopify scope) records an error timestamp and backs the
 // loop off for an hour so we don't re-hammer Shopify every 2-minute tick.
 async function tickStageMetafieldSync(env) {
-  if (!env.SHOPIFY_ACCESS_TOKEN) return;
+  if (!hasShopifyAuth(env)) return;
   await initIcpTables(env.DB);
 
   const lastError = await icpState(env, "stage_mf_last_error_at");
@@ -6599,7 +6692,7 @@ async function buildStageAffinity(env, { restart = false, full = false, pagesPer
 // Cron: only advance an in-progress affinity build (do NOT auto-start — it's a heavy
 // full-customer scan the user kicks on demand). 1hr error backoff.
 async function tickStageAffinity(env) {
-  if (!env.SHOPIFY_ACCESS_TOKEN) return;
+  if (!hasShopifyAuth(env)) return;
   await ensureAffinityTables(env.DB);
   if ((await icpState(env, "affinity_running")) === null) return;
   const lastError = await icpState(env, "affinity_last_error_at");
@@ -6619,7 +6712,7 @@ async function tickStageAffinity(env) {
 // tickStageAffinity. Runs at most once every 7 days. Deploying with no prior
 // completion makes it due immediately (doubles as a manual kick).
 async function tickWeeklyIcpRefresh(env) {
-  if (!env.SHOPIFY_ACCESS_TOKEN || !env.KLAVIYO_API_KEY) return;
+  if (!hasShopifyAuth(env) || !env.KLAVIYO_API_KEY) return;
   const phase = await icpState(env, "weekly_refresh_phase");
 
   if (phase === null) {
