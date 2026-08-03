@@ -1366,6 +1366,28 @@ async function initCxAgentTables(db) {
       created_at TEXT DEFAULT (datetime('now')),
       updated_at TEXT DEFAULT (datetime('now'))
     )`),
+    // v5.0: the ACTION LEDGER. Every real-world write the agent wants to make is recorded here
+    // first as 'proposed' and only performed after a human approves it. Nothing executes
+    // without an approver recorded, and eligibility is re-checked at execution time (warehouse
+    // state changes between proposing and approving).
+    db.prepare(`CREATE TABLE IF NOT EXISTS agent_actions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ticket_id INTEGER,
+      zendesk_ticket_id TEXT,
+      action_type TEXT NOT NULL,
+      target TEXT,
+      summary TEXT,
+      payload TEXT,
+      before_state TEXT,
+      status TEXT NOT NULL DEFAULT 'proposed',
+      result TEXT,
+      error TEXT,
+      proposed_by TEXT DEFAULT 'agent',
+      approved_by TEXT,
+      created_at TEXT DEFAULT (datetime('now')),
+      executed_at TEXT
+    )`),
+    db.prepare(`CREATE INDEX IF NOT EXISTS idx_actions_status ON agent_actions(status)`),
     db.prepare(`CREATE UNIQUE INDEX IF NOT EXISTS idx_knowledge_norm ON agent_knowledge(norm_key)`),
     db.prepare(`CREATE INDEX IF NOT EXISTS idx_knowledge_status ON agent_knowledge(status)`),
     // v4.9: background product-extraction jobs. The browser splits a PDF into chunk PDFs
@@ -1504,6 +1526,8 @@ async function initCxAgentTables(db) {
     ['self_learning_enabled', 'true', 'boolean', 'Nightly pass that derives lessons from rated replies (proposed for approval, never applied unreviewed)'],
     ['knowledge_max_entries', '150', 'number', 'Max approved knowledge entries injected into each draft (relevance-ranked)'],
     ['last_learn_run', '', 'string', 'Timestamp of the last self-learning pass (managed automatically)'],
+    ['actions_enabled', 'true', 'boolean', 'MASTER SWITCH for real-world writes (Shopify/ShipMonk). Off = the agent may still propose, but nothing can execute'],
+    ['action_types_enabled', '["address_change","shipmonk_cancel"]', 'json', 'Which action types may be proposed/executed. Money actions are deliberately NOT included'],
   ];
   for (const [key, value, value_type, description] of v411Keys) {
     const exists = await db.prepare("SELECT 1 FROM agent_config WHERE key = ?").bind(key).first();
@@ -2741,12 +2765,15 @@ async function cxShipmonkOrderState(env, orderNumber) {
       const data = await smFetch(env, '/orders-list', { method: 'GET', query: { page: 1, pageSize: 100, sortOrder: 'DESC' } });
       const root = data.data || data;
       const items = root.orders || root.items || root.results || (Array.isArray(root) ? root : []);
+      const norm = (v) => String(v || '').replace(/^#/, '').trim();
+      // Match the prefixed ShipMonk number against Shopify's bare numeric too (2-168562 vs 168562).
       const hit = items.map(smMapOrderRow).find(r =>
-        String(r.orderNumber || '').replace(/^#/, '').trim() === wanted ||
-        String(r.shipmentId || '').replace(/^#/, '').trim() === wanted);
+        norm(r.orderNumber) === wanted || norm(r.shipmentId) === wanted ||
+        norm(r.orderNumber).endsWith('-' + wanted));
       if (hit) {
         return {
           found: true, source: 'shipmonk_live', age: 'live (just fetched)',
+          order_key: hit.shipmentId || hit.orderNumber || wanted,
           shipped: !!hit.shipDate, ship_date: hit.shipDate || null,
           processing_status: hit.carrierStatus || null, carrier: hit.carrier || null, service: hit.service || null,
         };
@@ -2755,16 +2782,24 @@ async function cxShipmonkOrderState(env, orderNumber) {
   } catch (e) { /* fall through to the snapshot */ }
 
   // 2) Snapshot: the cron-synced tpl_orders table (main DB, not CX_AGENT_DB).
+  // NOTE: Shopify's order_number is the bare numeric (168562) while ShipMonk keeps the
+  // store-prefixed form (2-168562). Matching only on equality silently missed shipped orders
+  // and made them look cancellable — so also match on a "-<number>" suffix.
   try {
     const row = await env.DB.prepare(
       `SELECT shipment_id, order_number, ship_date, carrier, service, carrier_status, updated_at
-       FROM tpl_orders WHERE REPLACE(order_number,'#','') = ? OR REPLACE(shipment_id,'#','') = ? LIMIT 1`
-    ).bind(wanted, wanted).first();
+       FROM tpl_orders
+       WHERE REPLACE(order_number,'#','') = ?
+          OR REPLACE(shipment_id,'#','') = ?
+          OR REPLACE(order_number,'#','') LIKE ('%-' || ?)
+       LIMIT 1`
+    ).bind(wanted, wanted, wanted).first();
     if (row) {
       const ageMin = row.updated_at ? Math.round((Date.now() - new Date(row.updated_at + 'Z').getTime()) / 60000) : null;
       return {
         found: true, source: 'local_snapshot',
         age: ageMin == null ? 'unknown' : `synced ~${ageMin} min ago`,
+        order_key: row.shipment_id || row.order_number || wanted,
         shipped: !!row.ship_date, ship_date: row.ship_date || null,
         processing_status: row.carrier_status || null, carrier: row.carrier || null, service: row.service || null,
       };
@@ -2828,15 +2863,22 @@ function cxBuildOrderActionPlan(order, sm) {
       warnings: [...warnings, 'Time-sensitive: warehouse state can change within minutes. Re-check ShipMonk immediately before acting.'] };
   }
 
-  // Not in ShipMonk at all and not fulfilled — likely digital-only or not yet routed.
-  return { recommendation: 'cancel_possible_digital', headline: 'No warehouse shipment found — likely cancellable in Shopify alone',
+  // Not in ShipMonk at all and not fulfilled — likely digital-only, OR a sync/lookup gap.
+  // Treated as UNVERIFIED rather than safely cancellable: "absent from ShipMonk" is not proof
+  // that nothing shipped, and a wrong call here means telling a customer we stopped an order
+  // that is already on a truck.
+  const physicalHint = (order.line_items || []).some(li => !String(li.sku || '').startsWith('D-'));
+  return { recommendation: 'needs_verification', headline: 'Not found in ShipMonk — verify in the warehouse before promising anything',
     steps: [
-      `1. Confirm order ${order.name} has no physical items pending (digital/ebook orders never reach ShipMonk).`,
-      `2. Cancel + refund ${money(order.total_price)} in Shopify.`,
-      '3. If it contains ebook codes, note that already-redeemed codes may not be recoverable — check before refunding in full.',
+      `1. Look up order ${order.name} directly in ShipMonk. Do NOT rely on this check alone.`,
+      physicalHint
+        ? '2. This order appears to contain PHYSICAL items, so it should exist in ShipMonk — treat its absence as a lookup gap, not as "nothing to ship".'
+        : '2. All line items look digital (D- SKUs), so it plausibly never reached the warehouse.',
+      `3. If genuinely unshipped and you decide to cancel, cancel in ShipMonk first, then handle any refund of ${money(order.total_price)} in Shopify.`,
+      '4. If it contains ebook codes, already-redeemed codes may not be recoverable — check before refunding in full.',
     ],
     evidence,
-    warnings: [...warnings, 'Order was not found in ShipMonk — verify it is genuinely digital-only rather than a sync gap.'] };
+    warnings: [...warnings, 'Order was not found in ShipMonk (live or snapshot). This is NOT confirmation that it has not shipped — verify manually.'] };
 }
 
 // v4.11: gather Shopify + ShipMonk state for a refund/cancel/return request and return a
@@ -2850,7 +2892,9 @@ async function cxProposeOrderAction(ticketData, db, env) {
   if (!order) {
     return { ok: false, reason: `no matching Shopify order (lookup: ${found.found_by || 'none'})`, order_numbers_in_message: orderNumbers };
   }
-  const sm = await cxShipmonkOrderState(env, order.order_number || order.name);
+  // Prefer order.name ("#2-168562") — it carries the store prefix ShipMonk uses; Shopify's
+  // order_number is just the numeric tail.
+  const sm = await cxShipmonkOrderState(env, String(order.name || order.order_number || '').replace(/^#/, ''));
   const plan = cxBuildOrderActionPlan(order, sm);
   return {
     ok: true,
@@ -2890,6 +2934,170 @@ function cxFormatActionPlan(proposal) {
   }
   p.push(D);
   return p.join('\n');
+}
+
+// ============================================================================
+// v5.0: REAL-WORLD ACTIONS (Shopify + ShipMonk writes)
+// Every write goes through the agent_actions ledger: proposed -> approved by a human ->
+// executed. Eligibility is re-checked at execution time because warehouse state moves.
+// Deliberately NO money actions here (no cancel-with-refund, no refundCreate).
+// ============================================================================
+
+// US state names -> 2-letter codes, so an address parsed from a customer message
+// ("Florida") is accepted by both Shopify and ShipMonk.
+const US_STATES = { alabama: 'AL', alaska: 'AK', arizona: 'AZ', arkansas: 'AR', california: 'CA', colorado: 'CO', connecticut: 'CT', delaware: 'DE', 'district of columbia': 'DC', florida: 'FL', georgia: 'GA', hawaii: 'HI', idaho: 'ID', illinois: 'IL', indiana: 'IN', iowa: 'IA', kansas: 'KS', kentucky: 'KY', louisiana: 'LA', maine: 'ME', maryland: 'MD', massachusetts: 'MA', michigan: 'MI', minnesota: 'MN', mississippi: 'MS', missouri: 'MO', montana: 'MT', nebraska: 'NE', nevada: 'NV', 'new hampshire': 'NH', 'new jersey': 'NJ', 'new mexico': 'NM', 'new york': 'NY', 'north carolina': 'NC', 'north dakota': 'ND', ohio: 'OH', oklahoma: 'OK', oregon: 'OR', pennsylvania: 'PA', 'rhode island': 'RI', 'south carolina': 'SC', 'south dakota': 'SD', tennessee: 'TN', texas: 'TX', utah: 'UT', vermont: 'VT', virginia: 'VA', washington: 'WA', 'west virginia': 'WV', wisconsin: 'WI', wyoming: 'WY' };
+function cxNormalizeProvince(v) {
+  const s = String(v || '').trim();
+  if (!s) return s;
+  if (/^[A-Za-z]{2}$/.test(s)) return s.toUpperCase();
+  return US_STATES[s.toLowerCase()] || s;
+}
+
+// Ask the model whether the customer is requesting a shipping-address change, and if so what
+// the new address is. Returns null unless it's confident — a human still confirms the parsed
+// address against the customer's own words in the approval UI.
+async function cxExtractAddressChange(env, db, customerMessage, currentAddress) {
+  try {
+    const model = (await cxGetConfig(db, 'anthropic_model')) || 'claude-opus-4-8';
+    const sys = `Decide whether a customer is asking to CHANGE the shipping address on their order, and extract the new address.
+
+Only return an address when the customer clearly supplies a new/corrected delivery address for THIS order. Return requested=false for: tracking questions, "where is my order", billing address changes, general address questions, or anything ambiguous.
+
+Copy the address EXACTLY as the customer wrote it. Never invent, complete, or correct missing parts. If a required piece (street, city, state/province, postal code) is missing, set requested=false and say what's missing in "missing".
+
+Return ONLY valid JSON:
+{"requested":true|false,"confidence":0.0-1.0,"missing":"<what's absent, or empty>","address":{"address1":"","address2":"","city":"","province":"","zip":"","country":"","first_name":"","last_name":"","phone":""}}`;
+    const user = `CURRENT shipping address on the order:\n${JSON.stringify(currentAddress || {}, null, 1)}\n\nCUSTOMER MESSAGE:\n${String(customerMessage || '').slice(0, 2000)}`;
+    const resp = await cxCallClaude(env, model, sys, user, 700);
+    const p = cxExtractJson(resp.content);
+    if (!p || p.requested !== true || (p.confidence ?? 0) < 0.7) return null;
+    const a = p.address || {};
+    if (!a.address1 || !a.city || !a.zip) return null; // never propose a partial address
+    return {
+      address1: String(a.address1).trim(),
+      address2: String(a.address2 || '').trim(),
+      city: String(a.city).trim(),
+      province: cxNormalizeProvince(a.province),
+      zip: String(a.zip).trim(),
+      country: String(a.country || currentAddress?.country || 'United States').trim(),
+      first_name: String(a.first_name || currentAddress?.first_name || '').trim(),
+      last_name: String(a.last_name || currentAddress?.last_name || '').trim(),
+      phone: String(a.phone || currentAddress?.phone || '').trim(),
+      _confidence: p.confidence,
+    };
+  } catch (e) {
+    console.error('cxExtractAddressChange error:', e);
+    return null;
+  }
+}
+
+// Record a proposed action. Deduped so re-running the pipeline doesn't stack duplicates.
+async function cxProposeAction(db, { ticketId, zendeskTicketId, action_type, target, summary, payload, before_state }) {
+  const allowed = (await cxGetConfig(db, 'action_types_enabled')) || [];
+  if (!allowed.includes(action_type)) return { proposed: false, reason: `action type ${action_type} not enabled` };
+  const dupe = await db.prepare(
+    `SELECT id FROM agent_actions WHERE ticket_id = ? AND action_type = ? AND target = ? AND status IN ('proposed','approved','executed') LIMIT 1`
+  ).bind(ticketId ?? null, action_type, target ?? null).first();
+  if (dupe) return { proposed: false, reason: 'already proposed', id: dupe.id };
+  const res = await db.prepare(
+    `INSERT INTO agent_actions (ticket_id, zendesk_ticket_id, action_type, target, summary, payload, before_state, status)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 'proposed')`
+  ).bind(ticketId ?? null, String(zendeskTicketId || ''), action_type, target ?? null, summary ?? null,
+    JSON.stringify(payload || {}), JSON.stringify(before_state || {})).run();
+  return { proposed: true, id: res.meta.last_row_id };
+}
+
+// --- Shopify: update the shipping address on an order (REST; accepts free-text province/country)
+async function cxShopifyUpdateAddress(env, db, orderId, address) {
+  const shopDomain = await cxGetConfig(db, 'shopify_store_domain');
+  const body = { order: { id: Number(orderId), shipping_address: {
+    address1: address.address1, address2: address.address2 || '', city: address.city,
+    province: address.province, zip: address.zip, country: address.country,
+    first_name: address.first_name || '', last_name: address.last_name || '', phone: address.phone || '',
+  } } };
+  const resp = await fetch(`https://${shopDomain}/admin/api/2024-01/orders/${orderId}.json`, {
+    method: 'PUT',
+    headers: { 'X-Shopify-Access-Token': env.SHOPIFY_ACCESS_TOKEN, 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const text = await resp.text();
+  if (!resp.ok) {
+    const hint = resp.status === 403 || /access denied|scope/i.test(text)
+      ? ' — the Shopify token is missing the write_orders scope. Add it in the custom app\'s Admin API scopes and regenerate the token.'
+      : '';
+    throw new Error(`Shopify order update failed ${resp.status}: ${text.slice(0, 300)}${hint}`);
+  }
+  let json = null; try { json = JSON.parse(text); } catch {}
+  return { ok: true, shipping_address: json?.order?.shipping_address || null };
+}
+
+// --- ShipMonk: upsert the order (store_id + order_key is the key). Used both to push a new
+// address and to cancel (order_status: 'cancelled').
+async function cxShipmonkUpsertOrder(env, fields) {
+  if (!env.SHIPMONK_API_KEY) throw new Error('SHIPMONK_API_KEY is not configured');
+  if (!env.SHIPMONK_STORE_ID) throw new Error('SHIPMONK_STORE_ID is not configured');
+  const body = { store_id: env.SHIPMONK_STORE_ID, ...fields };
+  const resp = await fetch(`${SHIPMONK_BASE}/order`, {
+    method: 'POST',
+    headers: { 'Api-Key': env.SHIPMONK_API_KEY, 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const text = await resp.text();
+  if (!resp.ok) throw new Error(`ShipMonk order upsert failed ${resp.status}: ${text.slice(0, 300)}`);
+  let json = null; try { json = JSON.parse(text); } catch {}
+  return { ok: true, response: json ?? text.slice(0, 300) };
+}
+
+// Execute an approved action. Re-validates first — the warehouse may have shipped it since.
+async function cxExecuteAction(env, db, action) {
+  if ((await cxGetConfig(db, 'actions_enabled')) === false) throw new Error('actions_enabled is off — nothing can execute');
+  const allowed = (await cxGetConfig(db, 'action_types_enabled')) || [];
+  if (!allowed.includes(action.action_type)) throw new Error(`action type ${action.action_type} is not enabled`);
+
+  const payload = (() => { try { return JSON.parse(action.payload || '{}'); } catch { return {}; } })();
+  const orderNumber = payload.order_number || action.target;
+
+  // Guard: nothing may be changed once the warehouse has shipped it. Fail CLOSED — if we
+  // can't confirm the order's warehouse state we refuse, because "not found" is not proof
+  // that nothing shipped.
+  const sm = await cxShipmonkOrderState(env, String(orderNumber || '').replace(/^#/, ''));
+  if (sm.found && sm.shipped) {
+    throw new Error(`order ${orderNumber} has already SHIPPED (${sm.ship_date}) — too late to change or cancel; handle it as a return`);
+  }
+  if (!sm.found) {
+    throw new Error(`could not confirm order ${orderNumber} in ShipMonk, so its shipping state is unknown — refusing to act. Check the order in ShipMonk and do this manually if it really is unshipped.`);
+  }
+
+  if (action.action_type === 'address_change') {
+    if (!payload.shopify_order_id || !payload.address) throw new Error('missing shopify_order_id or address in payload');
+    const shopify = await cxShopifyUpdateAddress(env, db, payload.shopify_order_id, payload.address);
+    // Push the same address to ShipMonk so the label is right. Non-fatal if the order isn't there.
+    let shipmonk = { skipped: true, reason: 'order not found in ShipMonk' };
+    if (sm.found && payload.shipmonk_order_key) {
+      try {
+        shipmonk = await cxShipmonkUpsertOrder(env, {
+          order_key: payload.shipmonk_order_key,
+          ship_to: {
+            name: `${payload.address.first_name || ''} ${payload.address.last_name || ''}`.trim(),
+            address1: payload.address.address1, address2: payload.address.address2 || '',
+            city: payload.address.city, state: payload.address.province,
+            zip: payload.address.zip, country_code: /united states|^us$/i.test(payload.address.country) ? 'US' : payload.address.country,
+            phone: payload.address.phone || '',
+          },
+        });
+      } catch (e) { shipmonk = { ok: false, error: e.message }; }
+    }
+    return { shopify, shipmonk, shipmonk_state_at_exec: sm };
+  }
+
+  if (action.action_type === 'shipmonk_cancel') {
+    if (!payload.shipmonk_order_key) throw new Error('missing shipmonk_order_key in payload');
+    if (!sm.found) throw new Error(`order ${orderNumber} is not in ShipMonk — nothing to cancel there`);
+    const res = await cxShipmonkUpsertOrder(env, { order_key: payload.shipmonk_order_key, order_status: 'cancelled' });
+    return { shipmonk: res, shipmonk_state_at_exec: sm, note: 'Warehouse cancel only — no money was refunded. Issue any refund in Shopify separately.' };
+  }
+
+  throw new Error(`unknown action type: ${action.action_type}`);
 }
 
 // v4.11: verify a draft against the context it was given and STRIP anything unsupported.
@@ -2974,11 +3182,16 @@ async function cxDraftGeneralSuggestion(ticketId, ticketData, intent, db, env, t
       const { orders = [] } = await resp.json();
       return {
         orders: orders.slice(0, 5).map(o => ({
+          // id + order_number + shipping_address are needed by the v5.0 action proposals
+          // (Shopify writes are keyed by numeric id, and we diff the current address).
+          id: o.id,
+          order_number: o.order_number,
           name: o.name,
           created_at: o.created_at,
           financial_status: o.financial_status,
           fulfillment_status: o.fulfillment_status,
           total: o.total_price,
+          shipping_address: o.shipping_address || null,
           items: (o.line_items || []).map(li => `${li.quantity}× ${li.title}${li.sku ? ` (${li.sku})` : ''}`).join(', ')
         })),
         count: orders.length
@@ -3194,15 +3407,63 @@ Write the reply as Kristine.`;
   // and propose it for a human to execute. Read-only — nothing is mutated in either system.
   let actionPlanBlock = '';
   const actionIntents = ['refund_cancel', 'returns_damaged'];
+  let proposalData = null;
   if (actionIntents.includes(intent.intent) && (await cxGetConfig(db, 'order_action_proposals_enabled')) !== false) {
     const proposal = await tracer.trace('order_action_proposal', async () => {
       const p = await cxProposeOrderAction(ticketData, db, env);
       return { ok: p.ok, recommendation: p.plan?.recommendation, order: p.order?.name, shipmonk_source: p.shipmonk?.source, _proposal: p };
     });
     if (proposal?._proposal) {
+      proposalData = proposal._proposal;
       actionPlanBlock = cxFormatActionPlan(proposal._proposal);
       response.data_sources = { ...response.data_sources, action_plan: { recommendation: proposal.recommendation || null, order: proposal.order || null, ok: !!proposal.ok } };
     }
+  }
+
+  // STEP (v5.0): queue real-world actions for human approval. Nothing executes here — these
+  // land in the action ledger as 'proposed' and a teammate clicks Execute in the Ops Hub.
+  if ((await cxGetConfig(db, 'actions_enabled')) !== false) {
+    await tracer.trace('propose_actions', async () => {
+      const queued = [];
+      try {
+        // (a) Warehouse cancel — only when the order is genuinely still stoppable.
+        if (proposalData?.ok && proposalData.plan?.recommendation === 'cancel_possible') {
+          const smKey = proposalData.shipmonk?.order_key || proposalData.order?.order_number || proposalData.order?.name;
+          const r = await cxProposeAction(db, {
+            ticketId, zendeskTicketId: ticketData.zendeskTicketId, action_type: 'shipmonk_cancel',
+            target: proposalData.order?.name,
+            summary: `Cancel order ${proposalData.order?.name} at the warehouse (ShipMonk) — not yet shipped. No refund is issued by this action.`,
+            payload: { order_number: proposalData.order?.order_number || proposalData.order?.name, shipmonk_order_key: smKey },
+            before_state: { shipmonk: proposalData.shipmonk, shopify: { financial_status: proposalData.order?.financial_status, fulfillment_status: proposalData.order?.fulfillment_status, total: proposalData.order?.total } },
+          });
+          if (r.proposed) queued.push('shipmonk_cancel');
+        }
+
+        // (b) Shipping-address change — for order/shipping intents, when the customer gave a
+        // complete new address and the order hasn't shipped.
+        if (['order_general', 'shipping_delivery', 'returns_damaged'].includes(intent.intent)) {
+          const ord = orderContext.orders?.[0];
+          const full = ord && (await cxProposeOrderAction(ticketData, db, env).catch(() => null));
+          const target = full?.ok ? full : null;
+          const shipped = target?.shipmonk?.found ? target.shipmonk.shipped : /fulfilled|partial/i.test(String(ord?.fulfillment_status || ''));
+          if (ord && !shipped) {
+            const current = ord.shipping_address || target?.order?.shipping_address || null;
+            const addr = await cxExtractAddressChange(env, db, ticketData.firstMessage, current);
+            if (addr) {
+              const r = await cxProposeAction(db, {
+                ticketId, zendeskTicketId: ticketData.zendeskTicketId, action_type: 'address_change',
+                target: ord.name,
+                summary: `Change the shipping address on ${ord.name} to: ${addr.address1}${addr.address2 ? ', ' + addr.address2 : ''}, ${addr.city}, ${addr.province} ${addr.zip}`,
+                payload: { order_number: ord.order_number || ord.name, shopify_order_id: ord.id, shipmonk_order_key: target?.shipmonk?.found ? (target.shipmonk.order_key || ord.name) : null, address: addr },
+                before_state: { current_address: current, fulfillment_status: ord.fulfillment_status, shipmonk: target?.shipmonk || null },
+              });
+              if (r.proposed) queued.push('address_change');
+            }
+          }
+        }
+      } catch (e) { return { queued, error: e.message }; }
+      return { queued };
+    });
   }
 
   // STEP: Format as branded internal note
@@ -3926,6 +4187,82 @@ async function handleCxAgentAPI(request, env, path) {
       const body = await request.json();
       await db.prepare("UPDATE agent_templates SET body = ?, updated_at = datetime('now') WHERE id = ?").bind(body.body, parseInt(tplMatch[1])).run();
       return new Response(JSON.stringify({ updated: true }), { headers: cors });
+    }
+
+    // ==========================================================================
+    // v5.0: ACTION LEDGER APIs (real Shopify / ShipMonk writes, human-gated)
+    // ==========================================================================
+
+    // GET /cx-agent/api/actions?status=proposed|all
+    if (path === '/cx-agent/api/actions' && request.method === 'GET') {
+      const url = new URL(request.url);
+      const status = url.searchParams.get('status') || 'all';
+      const where = status === 'all' ? '1=1' : 'status = ?';
+      const stmt = db.prepare(
+        `SELECT id, ticket_id, zendesk_ticket_id, action_type, target, summary, payload, before_state,
+                status, result, error, approved_by, created_at, executed_at
+         FROM agent_actions WHERE ${where}
+         ORDER BY CASE status WHEN 'proposed' THEN 0 WHEN 'failed' THEN 1 ELSE 2 END, id DESC LIMIT 200`
+      );
+      const rows = (await (status === 'all' ? stmt.all() : stmt.bind(status).all())).results || [];
+      const counts = (await db.prepare("SELECT status, COUNT(*) n FROM agent_actions GROUP BY status").all()).results || [];
+      return new Response(JSON.stringify({
+        actions: rows, counts,
+        actions_enabled: (await cxGetConfig(db, 'actions_enabled')) !== false,
+        types_enabled: (await cxGetConfig(db, 'action_types_enabled')) || [],
+      }), { headers: cors });
+    }
+
+    // POST /cx-agent/api/actions/:id/(execute|reject)   — execute requires a human here
+    const actMatch = path.match(/^\/cx-agent\/api\/actions\/(\d+)\/(execute|reject)$/);
+    if (actMatch && request.method === 'POST') {
+      const id = parseInt(actMatch[1]);
+      const doExec = actMatch[2] === 'execute';
+      const body = await request.json().catch(() => ({}));
+      const who = String(body.approved_by || 'ops-hub user').slice(0, 80);
+
+      const action = await db.prepare('SELECT * FROM agent_actions WHERE id = ?').bind(id).first();
+      if (!action) return new Response(JSON.stringify({ error: 'action not found' }), { status: 404, headers: cors });
+      if (action.status === 'executed') return new Response(JSON.stringify({ error: 'already executed' }), { status: 409, headers: cors });
+
+      if (!doExec) {
+        await db.prepare("UPDATE agent_actions SET status='rejected', approved_by=? WHERE id=?").bind(who, id).run();
+        return new Response(JSON.stringify({ rejected: true, id }), { headers: cors });
+      }
+
+      // Claim it first so a double-click can't run it twice.
+      const claim = await db.prepare("UPDATE agent_actions SET status='executing', approved_by=? WHERE id=? AND status IN ('proposed','failed')").bind(who, id).run();
+      if (!(claim.meta?.changes > 0)) return new Response(JSON.stringify({ error: `action is ${action.status}, not executable` }), { status: 409, headers: cors });
+
+      try {
+        const result = await cxExecuteAction(env, db, action);
+        await db.prepare("UPDATE agent_actions SET status='executed', result=?, error=NULL, executed_at=datetime('now') WHERE id=?")
+          .bind(JSON.stringify(result).slice(0, 4000), id).run();
+        // Leave an audit trail on the ticket itself.
+        if (action.zendesk_ticket_id) {
+          try {
+            await cxPostInternalNote(action.zendesk_ticket_id,
+              `✅ ACTION EXECUTED by ${who}\n\n${action.summary || action.action_type}\n\nThis was performed in ${action.action_type === 'shipmonk_cancel' ? 'ShipMonk' : 'Shopify (and ShipMonk where applicable)'} via the Ops Hub. No refund was issued by this action.`,
+              db, env);
+          } catch {}
+        }
+        return new Response(JSON.stringify({ executed: true, id, result }), { headers: cors });
+      } catch (e) {
+        await db.prepare("UPDATE agent_actions SET status='failed', error=? WHERE id=?").bind(String(e.message).slice(0, 900), id).run();
+        return new Response(JSON.stringify({ executed: false, id, error: e.message }), { status: 500, headers: cors });
+      }
+    }
+
+    // POST /cx-agent/api/actions/propose  — manually queue an action (used for testing)
+    if (path === '/cx-agent/api/actions/propose' && request.method === 'POST') {
+      const body = await request.json();
+      if (!body.action_type) return new Response(JSON.stringify({ error: 'action_type required' }), { status: 400, headers: cors });
+      const r = await cxProposeAction(db, {
+        ticketId: body.ticket_id ?? null, zendeskTicketId: body.zendesk_ticket_id ?? '',
+        action_type: body.action_type, target: body.target ?? null,
+        summary: body.summary ?? null, payload: body.payload || {}, before_state: body.before_state || {},
+      });
+      return new Response(JSON.stringify(r), { headers: cors });
     }
 
     // ==========================================================================

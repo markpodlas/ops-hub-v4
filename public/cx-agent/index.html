@@ -154,6 +154,7 @@
   <button class="tab" data-tab="templates">Response Templates</button>
   <button class="tab" data-tab="products">Products</button>
   <button class="tab" data-tab="knowledge">Knowledge</button>
+  <button class="tab" data-tab="actions">Actions</button>
 </div>
 
 <!-- TICKETS TAB -->
@@ -276,6 +277,19 @@
   </div>
 </div>
 
+<!-- ACTIONS TAB -->
+<div class="tab-panel" id="tab-actions">
+  <div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:16px;margin-bottom:16px">
+    <div style="font-weight:600;font-size:15px;margin-bottom:4px">🛠️ Actions awaiting approval</div>
+    <div style="color:var(--text-muted);font-size:13px">
+      Real changes to Shopify and ShipMonk. The agent only ever <b>proposes</b> — nothing happens until someone here clicks Execute, and every action is logged with who approved it.
+      <b>No money actions exist:</b> refunds and Shopify cancellations are deliberately not built, so nothing here can move funds.
+    </div>
+    <div id="actions-status" style="font-size:12px;color:var(--text-muted);margin-top:8px"></div>
+  </div>
+  <div id="actions-list"><div class="loading">Loading actions...</div></div>
+</div>
+
 <!-- KNOWLEDGE TAB -->
 <div class="tab-panel" id="tab-knowledge">
   <div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:16px;margin-bottom:16px">
@@ -341,6 +355,7 @@ document.querySelectorAll('.tab').forEach(tab => {
     if (tab.dataset.tab === 'training') { loadTrainingInsights(); loadReadiness(); loadTraining(); }
     if (tab.dataset.tab === 'products') { loadProducts(); loadProductJobs(); }
     if (tab.dataset.tab === 'knowledge') loadKnowledge();
+    if (tab.dataset.tab === 'actions') loadActions();
   });
 });
 
@@ -549,6 +564,100 @@ async function saveTemplate(id) {
   } catch (e) {
     toast('Failed: ' + e.message, 'error');
   }
+}
+
+// ============ ACTIONS (real Shopify / ShipMonk writes, human-gated) ============
+
+async function loadActions() {
+  const el = document.getElementById('actions-list');
+  el.innerHTML = '<div class="loading">Loading actions...</div>';
+  try {
+    const d = await api('/actions?status=all');
+    const acts = d.actions || [];
+    const counts = {};
+    for (const c of d.counts || []) counts[c.status] = c.n;
+    const st = document.getElementById('actions-status');
+    if (st) {
+      st.innerHTML = `${counts.proposed || 0} awaiting approval · ${counts.executed || 0} executed · ${counts.failed || 0} failed · ${counts.rejected || 0} rejected` +
+        ` · master switch: <b style="color:${d.actions_enabled ? 'var(--green,#30a46c)' : 'var(--red,#e5484d)'}">${d.actions_enabled ? 'ON' : 'OFF'}</b>` +
+        ` · enabled types: ${(d.types_enabled || []).map(escape).join(', ') || 'none'}`;
+    }
+    if (!acts.length) {
+      el.innerHTML = '<div class="loading" style="padding:30px;text-align:center">No actions yet. The agent queues these when a customer asks to change a shipping address, or when an unshipped order can still be stopped at the warehouse.</div>';
+      return;
+    }
+    el.innerHTML = acts.map(renderAction).join('');
+  } catch (e) {
+    el.innerHTML = '<div class="loading">Could not load: ' + escape(e.message) + '</div>';
+  }
+}
+
+function renderAction(a) {
+  const parse = (s) => { try { return JSON.parse(s || '{}'); } catch { return {}; } };
+  const payload = parse(a.payload), before = parse(a.before_state), result = parse(a.result);
+  const isPending = a.status === 'proposed' || a.status === 'failed';
+  const statusPillMap = { proposed: 'pill-warn', executing: 'pill-info', executed: 'pill-success', failed: 'pill-error', rejected: 'pill-neutral' };
+  const typeLabel = { address_change: '📦 Change shipping address', shipmonk_cancel: '🛑 Cancel at warehouse (ShipMonk)' }[a.action_type] || a.action_type;
+
+  // Show exactly what changes — before vs after — so the approver isn't trusting a summary.
+  let diff = '';
+  if (a.action_type === 'address_change') {
+    const fmt = (x) => x ? [x.address1, x.address2, x.city, x.province || x.province_code, x.zip, x.country].filter(Boolean).join(', ') : '(unknown)';
+    diff = `
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px">
+        <div><div style="font-size:11px;color:var(--text-muted);margin-bottom:3px">CURRENT</div>
+          <div style="background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:8px;font-size:12px">${escape(fmt(before.current_address))}</div></div>
+        <div><div style="font-size:11px;color:var(--text-muted);margin-bottom:3px">WILL BECOME</div>
+          <div style="background:rgba(48,164,108,0.10);border:1px solid var(--green,#30a46c);border-radius:6px;padding:8px;font-size:12px">${escape(fmt(payload.address))}</div></div>
+      </div>`;
+  } else if (a.action_type === 'shipmonk_cancel') {
+    const sm = before.shipmonk || {};
+    diff = `<div style="margin-top:10px;font-size:12px;color:var(--text-muted)">Warehouse state when proposed: <b>${sm.shipped ? 'SHIPPED' : 'not shipped'}</b>${sm.processing_status ? ` (${escape(sm.processing_status)})` : ''} · ${escape(sm.age || 'unknown age')}. Shipping is re-checked at execution time.</div>`;
+  }
+
+  return `
+    <div class="card" style="background:var(--surface);border:1px solid ${isPending ? 'var(--amber,#f5a623)' : 'var(--border)'};border-radius:8px;padding:14px;margin-bottom:10px">
+      <div style="display:flex;justify-content:space-between;gap:12px;align-items:flex-start;flex-wrap:wrap">
+        <div style="flex:1;min-width:260px">
+          <div style="font-weight:600;font-size:13px">${typeLabel}${a.target ? ` · ${escape(a.target)}` : ''}</div>
+          <div style="font-size:12px;color:var(--text-muted);margin-top:3px">${escape(a.summary || '')}</div>
+          ${a.zendesk_ticket_id ? `<div style="font-size:11px;margin-top:4px"><a href="https://nurseinthemaking.zendesk.com/agent/tickets/${encodeURIComponent(a.zendesk_ticket_id)}" target="_blank" rel="noopener" style="color:var(--accent)">Ticket #${escape(String(a.zendesk_ticket_id))} ↗</a></div>` : ''}
+        </div>
+        <div style="text-align:right">
+          <span class="pill ${statusPillMap[a.status] || 'pill-neutral'}" style="font-size:11px">${escape(a.status)}</span>
+          <div style="font-size:11px;color:var(--text-dim);margin-top:4px">${formatDate(a.created_at)}</div>
+          ${a.approved_by ? `<div style="font-size:11px;color:var(--text-dim)">by ${escape(a.approved_by)}</div>` : ''}
+        </div>
+      </div>
+      ${diff}
+      ${a.error ? `<div style="margin-top:10px;background:rgba(229,72,77,0.08);border:1px solid var(--red,#e5484d);border-radius:6px;padding:8px;font-size:12px">${escape(a.error)}</div>` : ''}
+      ${a.status === 'executed' ? `<div style="margin-top:10px;font-size:11px;color:var(--text-muted)">Executed ${formatDate(a.executed_at)}${result.shipmonk && result.shipmonk.skipped ? ' · ShipMonk skipped: ' + escape(result.shipmonk.reason || '') : ''}</div>` : ''}
+      ${isPending ? `
+        <div style="display:flex;gap:6px;margin-top:12px;align-items:center;flex-wrap:wrap">
+          <button onclick="execAction(${a.id})" class="save-btn" style="font-size:12px;padding:6px 16px;background:var(--green);color:#fff;border:none;border-radius:4px;cursor:pointer;font-weight:600">${a.status === 'failed' ? 'Retry' : 'Execute'}</button>
+          <button onclick="rejectAction(${a.id})" style="font-size:12px;padding:6px 14px;background:transparent;border:1px solid var(--border);color:var(--text-muted);border-radius:4px;cursor:pointer">Reject</button>
+          <span style="font-size:11px;color:var(--text-dim)">This makes a real change in ${a.action_type === 'shipmonk_cancel' ? 'ShipMonk' : 'Shopify + ShipMonk'}. No refund is issued.</span>
+        </div>` : ''}
+    </div>`;
+}
+
+async function execAction(id) {
+  if (!confirm('Execute this action for real? It will change the live order.')) return;
+  const who = (localStorage.getItem('cx_reviewer') || '').trim() || prompt('Your name (recorded on the action):', '') || 'ops-hub user';
+  localStorage.setItem('cx_reviewer', who);
+  try {
+    const r = await api('/actions/' + id + '/execute', { method: 'POST', body: JSON.stringify({ approved_by: who }) });
+    toast(r.executed ? 'Done — the order was updated' : ('Failed: ' + (r.error || 'unknown')), r.executed ? 'success' : 'error');
+  } catch (e) { toast('Failed: ' + e.message, 'error'); }
+  loadActions();
+}
+
+async function rejectAction(id) {
+  try {
+    await api('/actions/' + id + '/reject', { method: 'POST', body: JSON.stringify({ approved_by: localStorage.getItem('cx_reviewer') || 'ops-hub user' }) });
+    toast('Rejected', 'success');
+  } catch (e) { toast('Failed: ' + e.message, 'error'); }
+  loadActions();
 }
 
 // ============ KNOWLEDGE / SELF-LEARNING ============
