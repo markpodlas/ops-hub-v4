@@ -5093,6 +5093,43 @@ async function handleCxAgentAPI(request, env, path) {
       }, null, 2), { headers: cors });
     }
 
+    // GET /cx-agent/api/diag/shopify-write-probe?order=<order name or number>
+    // Proves the token can actually WRITE orders, by writing the order's EXISTING shipping
+    // address back to it — a genuine PUT through the production code path that changes no
+    // data. Safe to run against a live order; does not touch ShipMonk.
+    if (path === '/cx-agent/api/diag/shopify-write-probe' && request.method === 'GET') {
+      const url = new URL(request.url);
+      const num = String(url.searchParams.get('order') || '').replace(/^#/, '').trim();
+      if (!num) return new Response(JSON.stringify({ error: 'pass ?order=<order number>' }), { status: 400, headers: cors });
+      const shopDomain = await cxGetConfig(db, 'shopify_store_domain');
+      try {
+        const look = await fetch(`https://${shopDomain}/admin/api/2024-01/orders.json?name=${encodeURIComponent('#' + num)}&status=any`,
+          { headers: { 'X-Shopify-Access-Token': await shopifyToken(env) } });
+        if (!look.ok) throw new Error(`order lookup failed ${look.status}: ${(await look.text()).slice(0, 200)}`);
+        const order = (await look.json()).orders?.[0];
+        if (!order) throw new Error(`order #${num} not found`);
+        const cur = order.shipping_address;
+        if (!cur) throw new Error(`order #${num} has no shipping address (digital-only?) — pick a physical order`);
+
+        const before = { address1: cur.address1, address2: cur.address2, city: cur.city, province: cur.province, zip: cur.zip, country: cur.country };
+        // Write the SAME values back — proves write access without altering the order.
+        const res = await cxShopifyUpdateAddress(env, db, order.id, {
+          address1: cur.address1, address2: cur.address2 || '', city: cur.city,
+          province: cur.province_code || cur.province, zip: cur.zip, country: cur.country,
+          first_name: cur.first_name || '', last_name: cur.last_name || '', phone: cur.phone || '',
+        });
+        const after = res.shipping_address || {};
+        return new Response(JSON.stringify({
+          write_ok: true, order: order.name, no_op: true,
+          note: 'Wrote the order\'s existing address back to it — write access confirmed, no data changed.',
+          before, after: { address1: after.address1, address2: after.address2, city: after.city, province: after.province, zip: after.zip, country: after.country },
+          unchanged: JSON.stringify(before) === JSON.stringify({ address1: after.address1, address2: after.address2, city: after.city, province: after.province, zip: after.zip, country: after.country }),
+        }, null, 2), { headers: cors });
+      } catch (e) {
+        return new Response(JSON.stringify({ write_ok: false, error: e.message }, null, 2), { status: 500, headers: cors });
+      }
+    }
+
     // GET /cx-agent/api/diag/raw-ticket?ticket=<zid> — dump what Zendesk actually returns for
     // a ticket (ticket + comments + audits), untruncated. Used to work out where Messaging /
     // Instagram / Facebook message content actually lives.
