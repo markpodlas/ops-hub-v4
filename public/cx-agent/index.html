@@ -1287,20 +1287,39 @@ function renderTimeline(d, t, turns) {
   // 1) The real conversation. For DM/Messaging it comes from the parsed chat transcript;
   //    for email it's each turn's customer message (deduped — reprocessing can repeat it).
   if (dmMsgs.length) {
-    // Two traps here: a transcript comment's created_at is when Zendesk WROTE the transcript
-    // (after the chat ended), and the "(HH:MM:SS)" in each line is in the ACCOUNT's timezone
-    // while our DB timestamps are UTC. So don't do timezone math — anchor the first message to
-    // ticket creation (they're the same event) and keep each message's offset from it.
+    // Reconstructing when a DM was actually sent takes both halves of the data:
+    //  - the "(HH:MM:SS)" in each line is the real send time, but in the ACCOUNT's timezone
+    //    and with NO DATE — so a reply the next morning (08:20) looks "earlier" than the
+    //    question from yesterday afternoon (16:29);
+    //  - the comment's created_at is a true UTC timestamp WITH the date, but it's when Zendesk
+    //    wrote the transcript, which lags the message.
+    // So: derive the timezone offset once (the first message ≈ ticket creation), then apply it
+    // to each message using the date from its own created_at.
     const secs = (hms) => { const p = String(hms || '').split(':').map(Number); return (p.length >= 2 && !p.some(isNaN)) ? (p[0] * 3600 + p[1] * 60 + (p[2] || 0)) : null; };
     const anchorMs = ms(t.received_at);
-    const firstSecs = secs(dmMsgs.find(m => m.time)?.time);
+    const first = dmMsgs.find(m => m.time && m.created_at);
+    let offsetSec = null;
+    if (anchorMs && first) {
+      const a = new Date(anchorMs);
+      const anchorSecs = a.getUTCHours() * 3600 + a.getUTCMinutes() * 60 + a.getUTCSeconds();
+      const fs = secs(first.time);
+      if (fs != null) {
+        offsetSec = anchorSecs - fs;
+        if (offsetSec < -12 * 3600) offsetSec += 24 * 3600;
+        if (offsetSec > 12 * 3600) offsetSec -= 24 * 3600;
+      }
+    }
     for (const m of dmMsgs) {
       let at = ms(m.created_at);
       const s = secs(m.time);
-      if (anchorMs && firstSecs != null && s != null) {
-        let delta = s - firstSecs;
-        if (delta < -12 * 3600) delta += 24 * 3600; // conversation rolled past midnight
-        at = anchorMs + delta * 1000;
+      if (offsetSec != null && s != null && at) {
+        const d0 = new Date(at);
+        const midnight = Date.UTC(d0.getUTCFullYear(), d0.getUTCMonth(), d0.getUTCDate());
+        let cand = midnight + (s + offsetSec) * 1000;
+        // A message can't have been sent after the transcript recorded it (allow a little slack);
+        // if it looks later, the transcript was written after midnight — shift back a day.
+        if (cand > at + 60000) cand -= 24 * 3600 * 1000;
+        at = cand;
       }
       events.push({ at, kind: m.fromCustomer ? 'customer' : 'team',
         sender: m.sender, time: m.time, text: m.text, dm: true });
@@ -1329,6 +1348,16 @@ function renderTimeline(d, t, turns) {
 
   events.sort((a, b) => a.at - b.at);
 
+  // A DM time is just a clock reading. When a reply lands on a later day, show the date too —
+  // otherwise "08:20:48" after a 16:29 question reads like it went backwards.
+  const dayOf = (msVal) => { const d = new Date(msVal); return isNaN(d) ? '' : `${d.getUTCFullYear()}-${d.getUTCMonth()}-${d.getUTCDate()}`; };
+  const firstDay = events.length ? dayOf(events[0].at) : '';
+  for (const e of events) {
+    if (e.dm && e.at && dayOf(e.at) !== firstDay) {
+      e.dateLabel = new Date(e.at).toLocaleDateString(undefined, { month: 'short', day: 'numeric', timeZone: 'UTC' });
+    }
+  }
+
   const totalAi = n;
   return events.map(e => {
     if (e.kind === 'customer') {
@@ -1347,8 +1376,8 @@ function dmBubble(e, fromCustomer) {
   return `
     <div style="display:flex;justify-content:${fromCustomer ? 'flex-start' : 'flex-end'};margin-bottom:10px">
       <div style="max-width:78%">
-        <div style="font-size:11px;color:var(--text-muted);margin-bottom:3px;${fromCustomer ? '' : 'text-align:right'}">${fromCustomer ? '👤 ' : '✅ '}<b>${escape(e.sender || (fromCustomer ? 'Customer' : 'Team'))}</b>${e.time ? ' · ' + escape(e.time) : ''}</div>
-        <div style="${BUBBLE};background:${fromCustomer ? 'var(--surface)' : 'rgba(48,164,108,0.10)'};border:1px solid ${fromCustomer ? 'var(--border)' : 'var(--green,#30a46c)'}">${escape(e.text)}</div>
+        <div style="font-size:11px;color:var(--text-muted);margin-bottom:3px;${fromCustomer ? '' : 'text-align:right'}">${fromCustomer ? '👤 ' : '✅ '}<b>${escape(e.sender || (fromCustomer ? 'Customer' : 'Team'))}</b>${e.dateLabel ? ' · ' + escape(e.dateLabel) : ''}${e.time ? ' · ' + escape(e.time) : ''}</div>
+        <div style="${BUBBLE};background:${fromCustomer ? 'var(--surface)' : 'rgba(48,164,108,0.10)'};border:1px solid ${fromCustomer ? 'var(--border)' : 'var(--green,#30a46c)'}">${escape(cleanReply(e.text) || e.text)}</div>
       </div>
     </div>`;
 }

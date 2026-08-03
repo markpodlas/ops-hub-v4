@@ -3426,6 +3426,9 @@ function cxParseChatTranscript(comments, customerName) {
       if (/^uploaded:/i.test(text) || /\bURL:\s*https?:\/\//.test(text)) {
         text = '[sent an attachment/image]';
       }
+      // Transcript bodies carry HTML entities (&nbsp; etc) — clean them so both the UI and the
+      // prompt get readable text.
+      text = cxCleanReplyText(text);
       if (!text) continue;
       lines.push({
         time, sender, text,
