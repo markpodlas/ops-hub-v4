@@ -494,40 +494,255 @@ document.getElementById('ticket-modal').addEventListener('click', (e) => {
 
 // ============ CONFIG ============
 
+// ============ CONFIGURATION (schema-driven: typed controls + plain-English help) ============
+// Each setting declares what it IS, so the UI can render a toggle / dropdown / list editor
+// instead of a raw text box, and can say what the value actually MEANS.
+const CFG_GROUPS = [
+  { id: 'safety',    title: '🚦 Safety & mode',        desc: 'Controls whether the agent can talk to customers at all. Start here.' },
+  { id: 'auto',      title: '🤖 Autonomous replies',   desc: 'The gates a draft must clear before it may ever be sent without a human.' },
+  { id: 'actions',   title: '🛠️ Order actions',        desc: 'Real changes in Shopify / ShipMonk. Every one still needs a human click.' },
+  { id: 'routing',   title: '🧭 Routing & escalation', desc: 'Which kinds of tickets get drafted, handled, or pushed to a human.' },
+  { id: 'filters',   title: '🚫 Filtering',            desc: 'Tickets the agent should ignore entirely.' },
+  { id: 'knowledge', title: '🧠 Knowledge & learning', desc: 'What the agent grounds answers in, and how it learns from your feedback.' },
+  { id: 'models',    title: '⚙️ Models',               desc: 'Which Claude model runs each step.' },
+  { id: 'integr',    title: '🔌 Integrations',         desc: 'Connected systems.' },
+  { id: 'managed',   title: '🔒 Managed automatically', desc: 'Set by the system. You normally never touch these.' },
+];
+
+const CFG = {
+  agent_enabled: { g:'safety', type:'toggle', label:'Agent enabled',
+    on:'The agent processes incoming tickets.', off:'Completely off — no classification, no drafts, nothing.' },
+  mode: { g:'safety', type:'enum', label:'Reply mode', options:[
+      { value:'internal_note', label:'Draft only — never messages customers', desc:'Posts every suggestion as an internal note in Zendesk. Your team reads it and decides. Nothing reaches a customer.' },
+      { value:'shadow',        label:'Shadow — draft only, but score itself', desc:'Same as draft-only: still nothing goes to customers. It additionally records whether it WOULD have auto-sent, so you can judge its judgement before trusting it.' },
+      { value:'auto_reply',    label:'⚠️ Auto-reply — LIVE, sends to customers', desc:'The agent actually emails customers when a draft clears every gate below. Only turn this on once shadow mode has looked right for a while.' },
+    ] },
+  auto_trigger_code_regeneration: { g:'safety', type:'toggle', label:'Auto-send replacement ebook codes', danger:true,
+    on:'⚠️ CUSTOMER-FACING: when an ebook order needs a new code, the agent fires the n8n webhook, which generates and EMAILS the code to the customer. This happens even in Draft-only mode, because it is not a Zendesk reply.',
+    off:'The agent will not trigger code generation. It drafts a note and a human regenerates the code.' },
+
+  auto_reply_intents: { g:'auto', type:'list', label:'Intents allowed to auto-send',
+    help:'Only these ticket types may ever be auto-replied to — and each still has to clear the accuracy and confidence gates below. Has no effect while mode is Draft only.' },
+  auto_reply_accuracy_bar: { g:'auto', type:'percent', label:'Required accuracy before auto-sending',
+    help:'How often your team must have rated this intent "Good" or "Minor edits". 0.9 = 90%. An intent below this bar can never auto-send.' },
+  auto_reply_min_sample: { g:'auto', type:'number', label:'Minimum rated replies required',
+    help:'How many rated examples an intent needs before the accuracy figure is trusted at all. 3 out of 3 proves nothing; 25 is a real sample.' },
+  min_confidence_to_auto_reply: { g:'auto', type:'percent', label:'Minimum confidence to auto-send',
+    help:'A single draft must be at least this confident. 0.90 = 90%.' },
+  min_confidence_to_respond: { g:'auto', type:'percent', label:'Minimum confidence to respond at all',
+    help:'Below this, the ticket is escalated to a human instead of drafted. 0.75 = 75%.' },
+
+  actions_enabled: { g:'actions', type:'toggle', label:'Allow order actions to execute',
+    on:'Approved actions can be executed against Shopify / ShipMonk when someone clicks Execute.',
+    off:'Kill switch. The agent may still propose actions, but nothing can be executed by anyone.' },
+  action_types_enabled: { g:'actions', type:'list', label:'Permitted action types',
+    help:'Which real-world changes are allowed. address_change = update a shipping address. shipmonk_cancel = stop an unshipped order at the warehouse. Refunds and Shopify cancellations are not built, so no action here can move money.' },
+  order_action_proposals_enabled: { g:'actions', type:'toggle', label:'Suggest action plans on refund/return tickets',
+    on:'On refund/return tickets the agent adds a read-only "proposed action" plan to the note (what it would do in Shopify and ShipMonk, and why).',
+    off:'No action plans are added.' },
+  max_order_age_days: { g:'actions', type:'number', label:'Ignore orders older than (days)',
+    help:'The agent will not act on or auto-answer about orders older than this.' },
+  require_email_match: { g:'actions', type:'toggle', label:'Require the email to match the order',
+    on:'The Zendesk requester’s email must match the Shopify order — unless they quoted an order number. Prevents answering about someone else’s order.',
+    off:'Looser matching. Not recommended.' },
+
+  scoped_intents: { g:'routing', type:'list', label:'Handled by a specialist flow',
+    help:'These intents run purpose-built logic rather than a generic AI draft (digital_access looks up and delivers ebook codes).' },
+  suggested_intents: { g:'routing', type:'list', label:'Get an AI-drafted suggestion',
+    help:'These intents get a written draft grounded in orders, help-centre articles and product knowledge.' },
+  hard_escalate_intents: { g:'routing', type:'list', label:'Always escalate (by intent)',
+    help:'These never get a customer-facing draft — they go straight to a human with an internal note. Use for anything commercially sensitive.' },
+  hard_escalate_topics: { g:'routing', type:'list', label:'Always escalate (by topic)',
+    help:'Matched against flags the classifier can raise. It only ever emits: clinical_question, refund_over_50, angry, urgent — anything else listed here does nothing.' },
+  noise_suggestion_enabled: { g:'routing', type:'toggle', label:'Recommend closing spam/noise',
+    on:'For tickets judged to be spam or automated mail, the agent posts a "recommend closing" note.',
+    off:'Noise tickets are left untouched.' },
+  followup_enabled: { g:'routing', type:'toggle', label:'Answer customer follow-ups',
+    on:'The agent responds to later messages in a conversation, not just the first one (reading the whole thread).',
+    off:'Only the first message of each ticket is ever handled.' },
+  followup_sweep_enabled: { g:'routing', type:'toggle', label:'Follow-up safety net (every 2 min)',
+    on:'A scheduled sweep catches customer replies even when Zendesk fails to notify us. Recommended — the Zendesk trigger has proven unreliable here.',
+    off:'Follow-ups depend entirely on Zendesk firing its webhook.' },
+  apply_zendesk_tags: { g:'routing', type:'toggle', label:'Tag tickets in Zendesk',
+    on:'Adds tags like ai-processed and ai-intent-… so you can filter and build views.', off:'No tags are written.' },
+
+  ignored_senders: { g:'filters', type:'list', label:'Never process these senders',
+    help:'Exact addresses, or "@domain.com" to block a whole domain. Includes your own domain so the agent never treats internal mail as a customer.' },
+  skip_outbound_tickets: { g:'filters', type:'toggle', label:'Skip tickets we started',
+    on:'If your team opened the ticket (outbound/proactive email), the agent leaves it alone — the customer did not ask for anything.',
+    off:'Outbound tickets are processed as if the customer wrote in.' },
+
+  product_kb_enabled: { g:'knowledge', type:'toggle', label:'Use the product knowledge base',
+    on:'Coverage questions ("do your guides cover cancer?") are answered from the product coverage maps in the Products tab.',
+    off:'Product questions are answered without that data.' },
+  product_kb_max_products: { g:'knowledge', type:'number', label:'Max products per draft',
+    help:'How many product coverage maps to feed the agent for one question.' },
+  knowledge_max_entries: { g:'knowledge', type:'number', label:'Max knowledge entries per draft',
+    help:'Approved facts from the Knowledge tab are ranked by relevance to the customer’s message; this caps how many are included.' },
+  grounding_check_enabled: { g:'knowledge', type:'toggle', label:'Fact-check every draft',
+    on:'After writing, a second pass checks each claim against the data the agent actually had and removes anything unsupported. This is the main guard against it inventing things.',
+    off:'⚠️ Drafts are sent to review unchecked.' },
+  self_learning_enabled: { g:'knowledge', type:'toggle', label:'Learn from corrections nightly',
+    on:'Once a day the agent compares its drafts to what your team actually sent and proposes lessons. Proposals wait for approval in the Knowledge tab — nothing is used unreviewed.',
+    off:'It only learns from notes you write by hand.' },
+  help_center_enabled: { g:'knowledge', type:'toggle', label:'Search the Help Centre',
+    on:'Relevant help-centre articles are pulled in as source material for drafts.', off:'Articles are not used.' },
+  help_center_max_articles: { g:'knowledge', type:'number', label:'Max articles per draft', help:'How many articles to include as context.' },
+
+  anthropic_model: { g:'models', type:'enum', label:'Writing model', options:[
+      { value:'claude-opus-4-8', label:'Opus 4.8 — best quality (recommended)', desc:'Used for customer-facing drafts and escalation notes.' },
+      { value:'claude-sonnet-5', label:'Sonnet 5 — cheaper, still strong', desc:'Noticeably cheaper; slightly less nuanced writing.' },
+    ] },
+  classifier_model: { g:'models', type:'enum', label:'Classifier model', options:[
+      { value:'claude-haiku-4-5-20251001', label:'Haiku 4.5 — cheap & fast (recommended)', desc:'Sorting a ticket into an intent is easy work; this is ~15× cheaper than Opus.' },
+      { value:'claude-opus-4-8', label:'Opus 4.8 — overkill', desc:'More accurate on odd edge cases, far more expensive per ticket.' },
+    ] },
+  product_extract_model: { g:'models', type:'enum', label:'Product-reading model', options:[
+      { value:'claude-opus-4-8', label:'Opus 4.8 — best for PDFs (recommended)', desc:'Reads uploaded product PDFs, including image-heavy ones.' },
+      { value:'claude-sonnet-5', label:'Sonnet 5 — cheaper', desc:'Fine for clean text PDFs; weaker on scans and diagrams.' },
+    ] },
+
+  shopify_store_domain: { g:'integr', type:'text', label:'Shopify store domain', help:'e.g. yourstore.myshopify.com' },
+  zendesk_subdomain: { g:'integr', type:'text', label:'Zendesk subdomain', help:'The part before .zendesk.com' },
+  n8n_code_generation_webhook: { g:'integr', type:'text', label:'n8n code-generation webhook',
+    help:'Called to generate a replacement ebook code. Governed by the "Auto-send replacement ebook codes" toggle above.' },
+  support_staff_ids: { g:'integr', type:'list', label:'Zendesk staff IDs',
+    help:'Legacy list used as a fallback for telling team replies from customer replies. The agent now mainly compares against the ticket requester, so this rarely matters.' },
+
+  bot_author_id: { g:'managed', type:'readonly', label:'Bot Zendesk user ID', help:'Auto-detected. Lets the agent tell its own replies apart from a teammate’s.' },
+  shopify_token_cache: { g:'managed', type:'secret', label:'Shopify token cache', help:'A live Shopify token, minted automatically and refreshed every 24 hours. Hidden on purpose — treat it like a password.' },
+  last_learn_run: { g:'managed', type:'readonly', label:'Last learning pass', help:'When the nightly learning pass last ran.' },
+};
+
 async function loadConfig() {
   const list = document.getElementById('config-list');
+  list.innerHTML = '<div class="loading">Loading settings…</div>';
   try {
     const data = await api('/config');
     const items = data.config || [];
-    list.innerHTML = items.map(c => `
-      <div class="config-item">
-        <div>
-          <div class="key">${c.key}</div>
-          <div class="desc">${escape(c.description || '')}</div>
-        </div>
-        <input type="text" class="value-input" data-key="${c.key}" value="${escape(c.value)}" />
-        <button class="save-btn" onclick="saveConfig('${c.key}', this)">Save</button>
-      </div>
-    `).join('');
+    const byKey = {};
+    for (const c of items) byKey[c.key] = c;
+
+    let html = `<div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:14px 16px;margin-bottom:16px">
+      <div style="font-size:13px;color:var(--text-muted)">Changes save immediately and take effect on the next ticket. The setting that decides whether customers ever hear from the agent is <b>Reply mode</b>, at the top.</div>
+    </div>`;
+
+    for (const g of CFG_GROUPS) {
+      const keys = Object.keys(CFG).filter(k => CFG[k].g === g.id && byKey[k]);
+      if (!keys.length) continue;
+      html += `<div style="margin:22px 0 10px">
+        <div style="font-weight:600;font-size:15px">${g.title}</div>
+        <div style="font-size:12px;color:var(--text-muted);margin-top:2px">${g.desc}</div>
+      </div>`;
+      html += keys.map(k => renderCfgRow(k, byKey[k])).join('');
+    }
+
+    // Anything not in the schema still gets a plain editor so nothing is unreachable.
+    const unknown = items.filter(c => !CFG[c.key]);
+    if (unknown.length) {
+      html += `<div style="margin:22px 0 10px"><div style="font-weight:600;font-size:15px">Other</div>
+        <div style="font-size:12px;color:var(--text-muted)">Not yet documented in this UI.</div></div>`;
+      html += unknown.map(c => renderCfgRow(c.key, c, true)).join('');
+    }
+    list.innerHTML = html;
   } catch (e) {
-    list.innerHTML = '<div class="empty">Failed to load config: ' + e.message + '</div>';
+    list.innerHTML = '<div class="loading">Failed to load settings: ' + escape(e.message) + '</div>';
   }
 }
 
-async function saveConfig(key, btn) {
-  const input = document.querySelector(`input[data-key="${key}"]`);
-  btn.disabled = true;
-  btn.textContent = 'Saving…';
-  try {
-    await api('/config', { method: 'POST', body: JSON.stringify({ key, value: input.value }) });
-    btn.textContent = 'Saved';
-    toast('Config updated: ' + key, 'success');
-    setTimeout(() => { btn.disabled = false; btn.textContent = 'Save'; }, 1500);
-  } catch (e) {
-    btn.disabled = false;
-    btn.textContent = 'Save';
-    toast('Failed: ' + e.message, 'error');
+const CFG_ROW = 'background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:14px 16px;margin-bottom:8px';
+const CFG_INPUT = 'background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:8px 10px;font-size:13px;color:var(--text);font-family:inherit;box-sizing:border-box';
+
+function renderCfgRow(key, c, raw) {
+  const meta = raw ? { type:'text', label:key } : (CFG[key] || { type:'text', label:key });
+  const val = String(c.value ?? '');
+  const id = 'cfg-' + key;
+  let control = '', explain = '';
+
+  if (meta.type === 'toggle') {
+    const on = val === 'true';
+    control = `<button id="${id}" onclick="cfgToggle('${key}')" data-on="${on}" style="border:none;cursor:pointer;border-radius:999px;width:52px;height:28px;position:relative;background:${on ? (meta.danger ? 'var(--amber,#f5a623)' : 'var(--green,#30a46c)') : 'var(--border)'};transition:background .15s">
+      <span style="position:absolute;top:3px;left:${on ? '27px' : '3px'};width:22px;height:22px;border-radius:50%;background:#fff;transition:left .15s"></span></button>
+      <span style="font-size:12px;font-weight:600;margin-left:10px;color:${on ? (meta.danger ? 'var(--amber,#f5a623)' : 'var(--green,#30a46c)') : 'var(--text-muted)'}">${on ? 'ON' : 'OFF'}</span>`;
+    explain = `<div style="font-size:12px;color:${on && meta.danger ? 'var(--amber,#f5a623)' : 'var(--text-muted)'};margin-top:8px">${escape(on ? (meta.on || '') : (meta.off || ''))}</div>`;
+  } else if (meta.type === 'enum') {
+    const cur = (meta.options || []).find(o => o.value === val);
+    control = `<select id="${id}" onchange="cfgSave('${key}', this.value)" style="${CFG_INPUT};min-width:340px">
+      ${(meta.options || []).map(o => `<option value="${escape(o.value)}" ${o.value === val ? 'selected' : ''}>${escape(o.label)}</option>`).join('')}
+      ${cur ? '' : `<option selected>${escape(val)} (current)</option>`}</select>`;
+    explain = `<div style="font-size:12px;color:${val === 'auto_reply' ? 'var(--amber,#f5a623)' : 'var(--text-muted)'};margin-top:8px">${escape(cur?.desc || '')}</div>`;
+  } else if (meta.type === 'percent') {
+    const pct = Math.round((parseFloat(val) || 0) * 100);
+    control = `<input id="${id}" type="number" min="0" max="100" step="1" value="${pct}" onchange="cfgSave('${key}', String(Math.max(0,Math.min(100,parseInt(this.value)||0))/100))" style="${CFG_INPUT};width:90px"><span style="font-size:13px;color:var(--text-muted);margin-left:6px">%</span>`;
+    explain = `<div style="font-size:12px;color:var(--text-muted);margin-top:8px">${escape(meta.help || '')} <span style="color:var(--text-dim)">(stored as ${escape(val)})</span></div>`;
+  } else if (meta.type === 'number') {
+    control = `<input id="${id}" type="number" value="${escape(val)}" onchange="cfgSave('${key}', this.value)" style="${CFG_INPUT};width:120px">`;
+    explain = `<div style="font-size:12px;color:var(--text-muted);margin-top:8px">${escape(meta.help || '')}</div>`;
+  } else if (meta.type === 'list') {
+    let arr = []; try { arr = JSON.parse(val); } catch { arr = []; }
+    if (!Array.isArray(arr)) arr = [];
+    control = `<div id="${id}" data-items='${escape(JSON.stringify(arr))}' style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">
+      ${arr.map((v, i) => `<span class="pill pill-info" style="font-size:11px;display:inline-flex;align-items:center;gap:6px">${escape(String(v))}
+        <button onclick="cfgListRemove('${key}',${i})" title="Remove" style="background:none;border:none;color:inherit;cursor:pointer;font-size:13px;line-height:1;padding:0">×</button></span>`).join('')}
+      <input placeholder="add…" onkeydown="if(event.key==='Enter'){event.preventDefault();cfgListAdd('${key}', this.value); this.value='';}" style="${CFG_INPUT};width:180px;padding:4px 8px;font-size:12px">
+    </div>`;
+    explain = `<div style="font-size:12px;color:var(--text-muted);margin-top:8px">${escape(meta.help || '')} <span style="color:var(--text-dim)">Type and press Enter to add; × to remove.</span></div>`;
+  } else if (meta.type === 'secret') {
+    control = `<span style="font-family:var(--font-mono,monospace);font-size:12px;color:var(--text-dim)">•••••••• hidden</span>`;
+    explain = `<div style="font-size:12px;color:var(--text-muted);margin-top:8px">${escape(meta.help || '')}</div>`;
+  } else if (meta.type === 'readonly') {
+    control = `<span style="font-family:var(--font-mono,monospace);font-size:12px;color:var(--text-muted)">${escape(val || '—')}</span>`;
+    explain = `<div style="font-size:12px;color:var(--text-muted);margin-top:8px">${escape(meta.help || '')}</div>`;
+  } else {
+    control = `<input id="${id}" type="text" value="${escape(val)}" onchange="cfgSave('${key}', this.value)" style="${CFG_INPUT};width:100%;max-width:520px">`;
+    explain = `<div style="font-size:12px;color:var(--text-muted);margin-top:8px">${escape(meta.help || c.description || '')}</div>`;
   }
+
+  return `<div style="${CFG_ROW}">
+    <div style="display:flex;justify-content:space-between;gap:16px;align-items:flex-start;flex-wrap:wrap">
+      <div style="min-width:220px;flex:1">
+        <div style="font-weight:500;font-size:14px">${escape(meta.label || key)}</div>
+        <div style="font-size:11px;color:var(--text-dim);font-family:var(--font-mono,monospace);margin-top:2px">${escape(key)}</div>
+      </div>
+      <div style="display:flex;align-items:center;flex-wrap:wrap">${control}</div>
+    </div>
+    ${explain}
+  </div>`;
+}
+
+async function cfgSave(key, value) {
+  try {
+    await api('/config', { method: 'POST', body: JSON.stringify({ key, value: String(value) }) });
+    toast('Saved: ' + key, 'success');
+    loadConfig();
+  } catch (e) { toast('Failed: ' + e.message, 'error'); loadConfig(); }
+}
+
+function cfgToggle(key) {
+  const el = document.getElementById('cfg-' + key);
+  const next = el.dataset.on !== 'true';
+  // Turning ON anything customer-facing deserves an explicit confirmation.
+  const meta = CFG[key] || {};
+  if (next && meta.danger && !confirm('This is customer-facing — turning it ON means the agent will email customers automatically. Continue?')) return;
+  cfgSave(key, next ? 'true' : 'false');
+}
+
+function cfgListItems(key) {
+  const el = document.getElementById('cfg-' + key);
+  try { return JSON.parse(el.dataset.items || '[]'); } catch { return []; }
+}
+function cfgListAdd(key, v) {
+  const val = String(v || '').trim();
+  if (!val) return;
+  const arr = cfgListItems(key);
+  if (arr.includes(val)) return;
+  arr.push(val);
+  cfgSave(key, JSON.stringify(arr));
+}
+function cfgListRemove(key, idx) {
+  const arr = cfgListItems(key);
+  arr.splice(idx, 1);
+  cfgSave(key, JSON.stringify(arr));
 }
 
 // ============ TEMPLATES ============

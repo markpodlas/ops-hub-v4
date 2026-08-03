@@ -1602,6 +1602,7 @@ async function initCxAgentTables(db) {
     ['last_learn_run', '', 'string', 'Timestamp of the last self-learning pass (managed automatically)'],
     ['actions_enabled', 'true', 'boolean', 'MASTER SWITCH for real-world writes (Shopify/ShipMonk). Off = the agent may still propose, but nothing can execute'],
     ['action_types_enabled', '["address_change","shipmonk_cancel"]', 'json', 'Which action types may be proposed/executed. Money actions are deliberately NOT included'],
+    ['auto_trigger_code_regeneration', 'true', 'boolean', 'Automatically fire the n8n webhook that generates + EMAILS a replacement ebook code. This is customer-facing and is NOT gated by mode'],
   ];
   for (const [key, value, value_type, description] of v411Keys) {
     const exists = await db.prepare("SELECT 1 FROM agent_config WHERE key = ?").bind(key).first();
@@ -2429,6 +2430,13 @@ async function cxDeliverExistingCodesMulti(ticketId, ticketData, fulfillments, d
 
 async function cxTriggerRegeneration(ticketId, ticketData, order, db, env, tracer) {
   await tracer.trace('trigger_n8n_regeneration', async () => {
+    // NOTE: this is the ONE automatic customer-facing side effect in the agent — n8n
+    // generates and emails a replacement ebook code. It is intentionally NOT gated by `mode`
+    // (mode governs Zendesk replies), so it fires even in internal_note mode. The toggle below
+    // exists so that can be turned off deliberately rather than by surprise.
+    if ((await cxGetConfig(db, 'auto_trigger_code_regeneration')) === false) {
+      return { webhook_triggered: false, skipped: 'auto_trigger_code_regeneration is off — a human must regenerate the code manually' };
+    }
     const webhookUrl = await cxGetConfig(db, 'n8n_code_generation_webhook');
     const payload = {
       id: order.id, name: order.name, order_number: order.order_number, email: order.email,
