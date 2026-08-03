@@ -1502,7 +1502,7 @@ async function initCxAgentTables(db) {
     ['grounding_check_enabled', 'true', 'boolean', 'Verify each draft against its context and strip claims it cannot support'],
     ['order_action_proposals_enabled', 'true', 'boolean', 'For refund/return tickets, post a proposed action plan (read-only; a human executes it)'],
     ['self_learning_enabled', 'true', 'boolean', 'Nightly pass that derives lessons from rated replies (proposed for approval, never applied unreviewed)'],
-    ['knowledge_max_entries', '40', 'number', 'Max approved knowledge entries injected into each draft'],
+    ['knowledge_max_entries', '150', 'number', 'Max approved knowledge entries injected into each draft (relevance-ranked)'],
     ['last_learn_run', '', 'string', 'Timestamp of the last self-learning pass (managed automatically)'],
   ];
   for (const [key, value, value_type, description] of v411Keys) {
@@ -1629,6 +1629,20 @@ async function handleCxAgentWebhook(request, env, ctx) {
       skipCheck.reason
     ).run();
     return new Response(JSON.stringify({ skipped: true, reason: skipCheck.reason }), { headers: cors });
+  }
+
+  // v4.13: Messaging/DM tickets arrive before their transcript does — the description is just
+  // "Conversation with X". Park them and let the cron pick them up once real content lands,
+  // rather than classifying a placeholder (which always came out as "noise").
+  if (ticketData.awaitingTranscript) {
+    await db.prepare(
+      `INSERT INTO agent_tickets (zendesk_ticket_id, subject, customer_email, channel, first_customer_message, status, final_action)
+       VALUES (?, ?, ?, ?, ?, 'awaiting_content', 'awaiting_content')`
+    ).bind(
+      String(zendeskTicketId), ticketData.subject ?? null, ticketData.customerEmail ?? null,
+      ticketData.channel ?? null, ticketData.firstMessage?.substring(0, 2000) ?? null
+    ).run();
+    return new Response(JSON.stringify({ deferred: true, reason: 'messaging transcript not available yet — will process when the message arrives' }), { headers: cors });
   }
 
   const insertResult = await db.prepare(
@@ -1910,6 +1924,47 @@ async function runCxAgentFollowup(ticketRow, ticketData, latestCustomerComment, 
     try { await tracer.trace('followup_error', async () => ({ error: err.message }), { status: 'error' }); } catch {}
     return false; // caller clears the turn claim so the next sweep retries
   }
+}
+
+// v4.13: process Messaging/DM tickets that were parked because their transcript hadn't
+// arrived yet. Runs on the cron; gives up after 24h so nothing lingers forever.
+async function sweepAwaitingContent(env) {
+  const db = env.CX_AGENT_DB;
+  if (!db) return { processed: 0 };
+  let processed = 0, stillWaiting = 0, expired = 0;
+  try {
+    const rows = (await db.prepare(
+      `SELECT id, zendesk_ticket_id, received_at FROM agent_tickets
+       WHERE status = 'awaiting_content' ORDER BY id DESC LIMIT 20`
+    ).all()).results || [];
+
+    for (const row of rows) {
+      try {
+        const ageMs = Date.now() - new Date(String(row.received_at).replace(' ', 'T') + 'Z').getTime();
+        const td = await cxFetchZendeskTicket(row.zendesk_ticket_id, db, env);
+        if (!td) continue;
+
+        if (td.awaitingTranscript) {
+          if (ageMs > 24 * 60 * 60 * 1000) {
+            // No message ever showed up (empty/abandoned conversation) — close it out quietly.
+            await db.prepare(`UPDATE agent_tickets SET status='ignored', final_action='ignored', error_message='no message content after 24h', completed_at=datetime('now') WHERE id=?`).bind(row.id).run();
+            expired++;
+          } else stillWaiting++;
+          continue;
+        }
+        if ((await cxShouldSkipTicket(td, db)).skip) {
+          await db.prepare(`UPDATE agent_tickets SET status='ignored', final_action='ignored', completed_at=datetime('now') WHERE id=?`).bind(row.id).run();
+          continue;
+        }
+        // Real content now available — store it and run the normal pipeline.
+        await db.prepare(`UPDATE agent_tickets SET status='processing', final_action=NULL, first_customer_message=? WHERE id=?`)
+          .bind(td.firstMessage?.substring(0, 2000) ?? null, row.id).run();
+        await runCxAgentPipeline(row.id, td, db, env);
+        processed++;
+      } catch (e) { /* per-ticket errors non-fatal */ }
+    }
+  } catch (e) { /* non-fatal */ }
+  return { processed, stillWaiting, expired };
 }
 
 // v4.10: cron sweep so follow-ups work even when the Zendesk reply trigger doesn't fire.
@@ -2544,16 +2599,33 @@ async function cxAddKnowledge(db, { category = 'policy', content, source = 'auth
 }
 
 // The approved knowledge the drafter is allowed to rely on.
-async function cxFetchKnowledge(db, limit = 40) {
+// `queryText` (the customer's message) puts the most RELEVANT facts first. This matters:
+// with a flat "newest 40" cut we shipped a draft that hedged about shipping to India while
+// an approved "we do not ship to India" fact sat at position 57 and never reached the prompt.
+async function cxFetchKnowledge(db, limit = 150, queryText = '') {
   try {
-    const rows = await db.prepare(`
-      SELECT category, content, source FROM agent_knowledge
+    const rows = (await db.prepare(`
+      SELECT category, content, source, updated_at FROM agent_knowledge
       WHERE status = 'approved'
       ORDER BY CASE category WHEN 'policy' THEN 0 WHEN 'product' THEN 1 WHEN 'process' THEN 2 ELSE 3 END,
                updated_at DESC
-      LIMIT ?
-    `).bind(limit).all();
-    return rows.results || [];
+    `).all()).results || [];
+    if (rows.length <= limit && !queryText) return rows;
+
+    // Cheap lexical relevance — no extra model call, no latency.
+    const stop = new Set(['this','that','with','from','have','when','they','their','there','which','about','would','should','could','been','were','what','your','you','and','the','for','are','our','not','can','will','has','how','who','into','over','than','then','them','also','only','just','out','get','all','any','use','used','using','make','need','want','ask','asks','asked','say','said','tell','customer','customers','order','orders','reach','reaches','email']);
+    const terms = new Set(String(queryText || '').toLowerCase().match(/[a-z0-9']{4,}/g)?.filter(w => !stop.has(w)) || []);
+    const scored = rows.map((r, i) => {
+      let score = 0;
+      if (terms.size) {
+        const words = new Set(String(r.content || '').toLowerCase().match(/[a-z0-9']{4,}/g) || []);
+        for (const t of terms) if (words.has(t)) score += 2;
+      }
+      if (r.category === 'tone') score += 1;        // voice rules are always applicable
+      return { r, score, i };
+    });
+    scored.sort((a, b) => (b.score - a.score) || (a.i - b.i));
+    return scored.slice(0, limit).map(s => s.r);
   } catch (err) {
     console.error('cxFetchKnowledge error:', err);
     return [];
@@ -2932,8 +3004,10 @@ async function cxDraftGeneralSuggestion(ticketId, ticketData, intent, db, env, t
   // STEP: Pull vetted past human replies for this intent as few-shot voice examples
   const examples = await tracer.trace('training_examples', async () => {
     const rows = await cxFetchExampleReplies(db, intent.intent, 6);
-    const maxK = (await cxGetConfig(db, 'knowledge_max_entries')) || 40;
-    const lessons = await cxFetchKnowledge(db, maxK);
+    const maxK = (await cxGetConfig(db, 'knowledge_max_entries')) || 150;
+    // Rank knowledge against what the customer actually asked, so relevant facts always
+    // survive the cap instead of being cut off by recency.
+    const lessons = await cxFetchKnowledge(db, maxK, `${ticketData.subject || ''}\n${ticketData.firstMessage || ''}\n${intent.intent}`);
     return {
       count: rows.length,
       with_notes: rows.filter(r => r.rating_note && String(r.rating_note).trim()).length,
@@ -3326,6 +3400,46 @@ async function cxEscalate(ticketId, ticketData, intent, reason, db, env, tracer,
   await db.prepare(`UPDATE agent_tickets SET status = 'escalated', final_action = 'escalated', completed_at = datetime('now') WHERE id = ?`).bind(ticketId).run();
 }
 
+// v4.13: Messaging channels (Instagram DM, FB Messenger, web chat) don't put the message in
+// the ticket description — that's just "Conversation with <name>". Each real message arrives
+// as its own comment with via.channel === 'chat_transcript' and author_id -1, shaped like:
+//   (13:27:52) Shannon Montgomery: 🔥
+// So the content IS in the Zendesk API; it just needs parsing (no Sunshine Conversations
+// credentials required). Note these comments land AFTER ticket creation, which is why the
+// agent used to classify the placeholder as noise.
+function cxParseChatTranscript(comments, customerName) {
+  const lines = [];
+  const cname = String(customerName || '').trim().toLowerCase();
+  for (const c of comments || []) {
+    if (c?.via?.channel !== 'chat_transcript') continue;
+    const raw = String(c.plain_body || c.body || '');
+    // A transcript comment can hold one or several "(time) Sender: text" lines.
+    const re = /\((\d{1,2}:\d{2}(?::\d{2})?)\)\s*([^:\n]{1,80}?):\s*([\s\S]*?)(?=\n\(\d{1,2}:\d{2}|$)/g;
+    let m, found = false;
+    while ((m = re.exec(raw)) !== null) {
+      found = true;
+      let [, time, sender, text] = m;
+      sender = sender.trim();
+      text = String(text || '').trim();
+      // Image/file uploads render as "<name> uploaded: <kind>" plus a signed URL — keep it
+      // short and don't drag CDN links into the prompt.
+      if (/^uploaded:/i.test(text) || /\bURL:\s*https?:\/\//.test(text)) {
+        text = '[sent an attachment/image]';
+      }
+      if (!text) continue;
+      lines.push({
+        time, sender, text,
+        fromCustomer: cname ? sender.toLowerCase() === cname : false,
+        comment_id: c.id, created_at: c.created_at,
+      });
+    }
+    if (!found && raw.trim()) {
+      lines.push({ time: null, sender: null, text: raw.trim().slice(0, 1000), fromCustomer: true, comment_id: c.id, created_at: c.created_at });
+    }
+  }
+  return lines;
+}
+
 async function cxFetchZendeskTicket(ticketId, db, env) {
   const subdomain = await cxGetConfig(db, 'zendesk_subdomain');
   const auth = btoa(`${env.ZENDESK_EMAIL}/token:${env.ZENDESK_API_TOKEN}`);
@@ -3353,18 +3467,43 @@ async function cxFetchZendeskTicket(ticketId, db, env) {
   }
   // For Messaging tickets, ticket.description is often a placeholder like "Conversation with [name]".
   // Always prefer the first real customer comment if one exists.
-  const firstCustomerMessage = customerComments[0]?.plain_body || ticket.description || null;
+  let firstCustomerMessage = customerComments[0]?.plain_body || ticket.description || null;
   // Messaging channels (instagram_dm, native_messaging, sunshine_conversations_*) often have no requester email.
   const channel = ticket.via?.channel ?? null;
-  const isMessagingChannel = channel && (channel === 'instagram_dm' || channel === 'native_messaging' || channel.startsWith('sunshine_conversations'));
+  const isMessagingChannel = channel && (channel === 'instagram_dm' || channel === 'native_messaging' || channel === 'chat' || channel.startsWith('sunshine_conversations'));
+
+  // The requester's display name: Messaging tickets don't sideload the user, but the
+  // description reliably reads "Conversation with <name>".
+  const descName = /^Conversation with\s+(.+)$/i.exec(String(ticket.description || '').trim())?.[1]?.trim() || null;
+  const customerName = ticket.requester?.name ?? descName ?? null;
+
+  // v4.13: pull the real DM content out of the chat_transcript comments.
+  let transcriptMessages = [];
+  let awaitingTranscript = false;
+  if (isMessagingChannel) {
+    transcriptMessages = cxParseChatTranscript(comments, customerName);
+    const customerLines = transcriptMessages.filter(m => m.fromCustomer);
+    // Prefer real customer lines; if we can't tell who's who, use everything we parsed.
+    const useLines = customerLines.length ? customerLines : transcriptMessages;
+    if (useLines.length) {
+      firstCustomerMessage = useLines.map(m => m.text).join('\n');
+    } else {
+      // Nothing but the placeholder so far — the transcript hasn't landed yet. Don't let the
+      // classifier judge "Conversation with X" (it reliably calls that noise).
+      awaitingTranscript = true;
+    }
+  }
+
   return {
     zendeskTicketId: ticketId,
     subject: ticket.subject ?? null,
     customerEmail: ticket.requester?.email ?? ticket.via?.source?.from?.address ?? null,
-    customerName: ticket.requester?.name ?? null,
+    customerName,
     channel,
     isMessagingChannel,
     firstMessage: firstCustomerMessage,
+    transcriptMessages,
+    awaitingTranscript,
     status: ticket.status ?? null,
     ticket,
     comments
@@ -4110,7 +4249,19 @@ async function handleCxAgentAPI(request, env, path) {
          ORDER BY reply_created_at ASC`
       ).bind(tid).all()).results || [];
 
-      return new Response(JSON.stringify({ ticket, turns: [...seen.values()], unlinked_replies: unlinked }), { headers: cors });
+      // For DM/Messaging tickets the real conversation lives in chat_transcript comments, not
+      // in the ticket body — fetch and parse it so reviewers see actual messages instead of
+      // "Conversation with X".
+      let dm = null;
+      const ch = String(ticket.channel || '');
+      if (ch === 'instagram_dm' || ch === 'native_messaging' || ch === 'chat' || ch.startsWith('sunshine_conversations')) {
+        try {
+          const td = await cxFetchZendeskTicket(ticket.zendesk_ticket_id, db, env);
+          if (td?.transcriptMessages?.length) dm = { customer_name: td.customerName, messages: td.transcriptMessages };
+        } catch {}
+      }
+
+      return new Response(JSON.stringify({ ticket, turns: [...seen.values()], unlinked_replies: unlinked, dm }), { headers: cors });
     }
 
     // POST /cx-agent/api/training/correct-draft  { response_id, text, author? }
@@ -4370,6 +4521,76 @@ async function handleCxAgentAPI(request, env, path) {
         note: 'Senders with 2+ noise-classified tickets. Add the ones you never want processed to the ignored_senders config (exact address, or "@domain" to block the whole domain).',
         senders: rows,
         by_domain: Object.entries(domains).sort((a, b) => b[1] - a[1]).map(([domain, noise]) => ({ domain, noise })),
+      }, null, 2), { headers: cors });
+    }
+
+    // POST /cx-agent/api/diag/reprocess-messaging?limit=25[&dry=1]
+    // Messaging/DM tickets processed before v4.13 were classified on the "Conversation with X"
+    // placeholder and almost always came out as noise. This re-runs them against the real
+    // transcript. dry=1 previews what would change without touching anything.
+    if (path === '/cx-agent/api/diag/reprocess-messaging' && request.method === 'POST') {
+      const url = new URL(request.url);
+      const limit = Math.min(Math.max(parseInt(url.searchParams.get('limit') || '25'), 1), 100);
+      const dry = url.searchParams.get('dry') === '1';
+      const rows = (await db.prepare(`
+        SELECT id, zendesk_ticket_id, channel, classified_intent, first_customer_message
+        FROM agent_tickets
+        WHERE (channel IN ('instagram_dm','native_messaging','chat') OR channel LIKE 'sunshine_conversations%')
+          AND (first_customer_message IS NULL OR first_customer_message LIKE 'Conversation with %')
+          AND status != 'ignored'
+        ORDER BY id DESC LIMIT ?
+      `).bind(limit).all()).results || [];
+
+      const results = [];
+      for (const row of rows) {
+        try {
+          const td = await cxFetchZendeskTicket(row.zendesk_ticket_id, db, env);
+          if (!td) { results.push({ ticket: row.zendesk_ticket_id, skipped: 'fetch failed' }); continue; }
+          if (td.awaitingTranscript) { results.push({ ticket: row.zendesk_ticket_id, skipped: 'still no transcript' }); continue; }
+          const preview = String(td.firstMessage || '').slice(0, 120);
+          if (dry) { results.push({ ticket: row.zendesk_ticket_id, was: row.classified_intent, real_message: preview }); continue; }
+          // Clear the old verdict and re-run against the real message.
+          await db.prepare(`DELETE FROM agent_decisions WHERE ticket_id = ?`).bind(row.id).run();
+          await db.prepare(`DELETE FROM agent_responses WHERE ticket_id = ?`).bind(row.id).run();
+          await db.prepare(`UPDATE agent_tickets SET status='processing', final_action=NULL, classified_intent=NULL, intent_confidence=NULL, first_customer_message=? WHERE id=?`)
+            .bind(preview ? String(td.firstMessage).slice(0, 2000) : null, row.id).run();
+          await runCxAgentPipeline(row.id, td, db, env);
+          const after = await db.prepare(`SELECT classified_intent, status FROM agent_tickets WHERE id = ?`).bind(row.id).first();
+          results.push({ ticket: row.zendesk_ticket_id, was: row.classified_intent, now: after?.classified_intent, status: after?.status, real_message: preview });
+        } catch (e) { results.push({ ticket: row.zendesk_ticket_id, error: e.message }); }
+      }
+      return new Response(JSON.stringify({ dry_run: dry, examined: rows.length, results }, null, 2), { headers: cors });
+    }
+
+    // GET /cx-agent/api/diag/raw-ticket?ticket=<zid> — dump what Zendesk actually returns for
+    // a ticket (ticket + comments + audits), untruncated. Used to work out where Messaging /
+    // Instagram / Facebook message content actually lives.
+    if (path === '/cx-agent/api/diag/raw-ticket' && request.method === 'GET') {
+      const url = new URL(request.url);
+      const zid = url.searchParams.get('ticket');
+      if (!zid) return new Response(JSON.stringify({ error: 'pass ?ticket=<zendesk_ticket_id>' }), { status: 400, headers: cors });
+      const subdomain = await cxGetConfig(db, 'zendesk_subdomain');
+      const auth = btoa(`${env.ZENDESK_EMAIL}/token:${env.ZENDESK_API_TOKEN}`);
+      const get = async (p) => {
+        try {
+          const r = await fetch(`https://${subdomain}.zendesk.com${p}`, { headers: { Authorization: `Basic ${auth}` } });
+          return r.ok ? await r.json() : { _status: r.status, _body: (await r.text()).slice(0, 400) };
+        } catch (e) { return { _error: e.message }; }
+      };
+      const t = await get(`/api/v2/tickets/${zid}.json`);
+      const c = await get(`/api/v2/tickets/${zid}/comments.json`);
+      const a = await get(`/api/v2/tickets/${zid}/audits.json`);
+      return new Response(JSON.stringify({
+        ticket_via: t?.ticket?.via, ticket_description: t?.ticket?.description,
+        requester_id: t?.ticket?.requester_id, submitter_id: t?.ticket?.submitter_id,
+        comments: (c?.comments || []).map(x => ({
+          id: x.id, author_id: x.author_id, public: x.public, type: x.type, created_at: x.created_at,
+          via: x.via, plain_body: x.plain_body, body: x.body, html_body: (x.html_body || '').slice(0, 500),
+          attachments: (x.attachments || []).length, metadata: x.metadata,
+        })),
+        audit_events: (a?.audits || []).flatMap(au => (au.events || []).map(e => ({
+          audit_id: au.id, type: e.type, field_name: e.field_name, value: typeof e.value === 'string' ? e.value.slice(0, 400) : e.value, body: e.body ? String(e.body).slice(0, 400) : undefined,
+        }))).slice(0, 60),
       }, null, 2), { headers: cors });
     }
 
@@ -6991,6 +7212,8 @@ export default {
     ctx.waitUntil((async () => { try { await processProductJobs(env); } catch (e) { /* non-fatal */ } })());
     // Catch customer follow-ups even if the Zendesk reply trigger doesn't fire.
     ctx.waitUntil((async () => { try { await sweepFollowups(env); } catch (e) { /* non-fatal */ } })());
+    // Process DM/Messaging tickets once their chat transcript actually arrives.
+    ctx.waitUntil((async () => { try { await sweepAwaitingContent(env); } catch (e) { /* non-fatal */ } })());
     // Self-learning: derive lessons from newly-rated replies, once every ~24h.
     ctx.waitUntil((async () => {
       try {

@@ -912,6 +912,7 @@ function statusPill(status) {
     auto_replied: 'pill-success',
     escalated: 'pill-warn',
     ignored: 'pill-neutral',
+    awaiting_content: 'pill-info',
     error: 'pill-error'
   };
   return `<span class="pill ${map[status] || 'pill-neutral'}">${status}</span>`;
@@ -929,6 +930,7 @@ function actionPill(action) {
     'shadow_held':          { label: '👁 Shadow: held', cls: 'pill-neutral' },
     'suggest_close':        { label: '🗑️ Recommend close', cls: 'pill-warn' },
     'ignored':              { label: '🚫 Ignored sender', cls: 'pill-neutral' },
+    'awaiting_content':     { label: '⏳ Waiting for DM text', cls: 'pill-info' },
     'escalated':            { label: '⚠️ Escalated', cls: 'pill-warn' }
   };
   const { label, cls } = labels[action] || { label: action, cls: 'pill-neutral' };
@@ -1218,10 +1220,24 @@ async function openThread(ticketId) {
         </div>
       </div>`;
 
+    // DM/Messaging tickets: show the real Instagram/Facebook conversation, which lives in
+    // Zendesk's chat_transcript comments rather than the ticket body.
+    const dmBlock = (d.dm && d.dm.messages && d.dm.messages.length) ? `
+      <div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:14px;margin-bottom:16px">
+        <div style="font-size:12px;color:var(--text-muted);margin-bottom:10px">💬 <b>${escape(t.channel || 'Messaging')} conversation</b>${d.dm.customer_name ? ' with ' + escape(d.dm.customer_name) : ''}</div>
+        ${d.dm.messages.map(m => `
+          <div style="display:flex;justify-content:${m.fromCustomer ? 'flex-start' : 'flex-end'};margin-bottom:8px">
+            <div style="max-width:78%">
+              <div style="font-size:11px;color:var(--text-dim);margin-bottom:3px;${m.fromCustomer ? '' : 'text-align:right'}">${escape(m.sender || (m.fromCustomer ? 'Customer' : 'Team'))}${m.time ? ' · ' + escape(m.time) : ''}</div>
+              <div style="${BUBBLE};background:${m.fromCustomer ? 'var(--surface2)' : 'rgba(48,164,108,0.10)'};border:1px solid ${m.fromCustomer ? 'var(--border)' : 'var(--green,#30a46c)'}">${escape(m.text)}</div>
+            </div>
+          </div>`).join('')}
+      </div>` : '';
+
     const thread = turns.map((turn, i) => renderThreadTurn(turn, i, turns.length)).join('');
     const extras = (d.unlinked_replies || []).length
       ? `<div style="margin-top:12px">${d.unlinked_replies.map(r => bubbleTeam(r)).join('')}</div>` : '';
-    container.innerHTML = header + thread + extras;
+    container.innerHTML = header + dmBlock + thread + extras;
   } catch (e) {
     container.innerHTML = `<button onclick="closeThread()" style="font-size:12px;padding:5px 12px;background:transparent;border:1px solid var(--border);color:var(--text-muted);border-radius:4px;cursor:pointer">← All tickets</button>
       <div class="loading">Could not load: ${escape(e.message)}</div>`;
