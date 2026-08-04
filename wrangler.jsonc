@@ -8,6 +8,13 @@
   "not_found_handling": "single-page-application",
   "run_worker_first": true
   },
+  // Non-secret config. GEMINI_API_KEY is a SECRET — `npx wrangler secret put
+  // GEMINI_API_KEY` (this repo is public; never put the key in this file).
+  "vars": {
+    // Video Review module. gemini-2.5-flash RETIRES 2026-10-16 — swapping this
+    // string is the entire migration path, no code change needed.
+    "GEMINI_MODEL": "gemini-2.5-flash"
+  },
   "d1_databases": [
     {
       "binding": "DB",

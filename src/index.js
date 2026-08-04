@@ -1,4 +1,5 @@
 import { handleStageRoutes } from "./stage-tracker.js";
+import { handleVideoReviewAPI } from "./video-review.js";
 // ===== OPS HUB WORKER — v5 with 3PL API consolidated =====
 const CLICKUP_API = "https://api.clickup.com/api/v2";
 const SHEET_BASE = "https://docs.google.com/spreadsheets/d/e/2PACX-1vSCO2_B3HitEVQIJE71RL357tdUPErxkhG4AdwXapyhOWtry_-czGMVg_HpZ0paQQ/pub";
@@ -7620,6 +7621,8 @@ export default {
     if (path.startsWith("/3pl/api/")) { return handle3plAPI(request, env, path); }
     // ===== MEDICAL SUPPLIES API (D1-backed) =====
     if (path.startsWith("/med-supplies/api/")) { return handleMedSuppliesAPI(request, env, path); }
+    // ===== VIDEO REVIEW (Gemini QA for nursing videos) =====
+    if (path.startsWith("/video-review/api/")) { return handleVideoReviewAPI(request, env, path); }
     // ===== CAMPAIGN ROUTER API (D1-backed, shared audience config) =====
     if (path === "/campaign-router/api/audiences") {
       const SEED = [
