@@ -29,6 +29,7 @@
     { href: "/3pl/", label: "3PL" },
     { href: "/med-supplies/", label: "Med Supplies" },
     { href: "/tracker/", label: "Tracker" },
+    { href: "/video-review/", label: "Video Review" },
     { href: "/social/", label: "Social" },
     { href: "/ambassadors/", label: "Ambassadors" },
     { href: "/growth/", label: "Growth" },
@@ -79,7 +80,7 @@
 
   function build() {
     // Remove any pre-existing top nav (old hard-coded ones, or a prior inject).
-    var moduleLink = /href="\/(calendar|inventory|3pl|med-supplies|tracker|social|ambassadors|growth|icp|cx-agent|stage|campaign-router)\/?"/;
+    var moduleLink = /href="\/(calendar|inventory|3pl|med-supplies|tracker|video-review|social|ambassadors|growth|icp|cx-agent|stage|campaign-router)\/?"/;
     Array.prototype.slice.call(document.querySelectorAll("nav")).forEach(function (n) {
       if (n.classList.contains("nitm-nav")) { n.remove(); return; }
       if (n.classList.contains("top-nav") || moduleLink.test(n.innerHTML)) n.remove();

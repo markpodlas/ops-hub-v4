@@ -35,6 +35,10 @@
     {
       "binding": "MED_IMAGES",
       "bucket_name": "med-supplies-images"
+    },
+    {
+      "binding": "VIDEO_REVIEW_UPLOADS",
+      "bucket_name": "nitm-video-review"
     }
   ],
   "triggers": {

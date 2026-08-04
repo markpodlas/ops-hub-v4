@@ -1,0 +1,382 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>Video Review — NITM Ops</title>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --accent: #7c3aed; --accent-text: #ffffff;
+    --red: #dc2626; --red-bg: #fee2e2; --amber: #b45309; --amber-bg: #fef3c7;
+    --green: #15803d; --green-bg: #dcfce7; --blue: #1d4ed8; --blue-bg: #dbeafe;
+  }
+  :root[data-theme="dark"] {
+    --accent: #a78bfa; --accent-text: #1e1b3a;
+    --red: #f87171; --red-bg: #431a1a; --amber: #fbbf24; --amber-bg: #422f06;
+    --green: #4ade80; --green-bg: #10331c; --blue: #93c5fd; --blue-bg: #16264a;
+  }
+  * { box-sizing: border-box; margin: 0; }
+  body { background: var(--bg); color: var(--text); font-family: 'DM Sans', system-ui, -apple-system, sans-serif; padding-bottom: 60px; }
+  .wrap { max-width: 900px; margin: 0 auto; padding: 28px 20px; }
+  h1 { font-size: 26px; font-weight: 700; letter-spacing: -0.3px; }
+  .sub { font-size: 14px; color: var(--muted); margin-top: 5px; }
+
+  /* ---- drop zone ---- */
+  .drop {
+    margin-top: 24px; border: 2px dashed var(--border2); border-radius: 16px;
+    background: var(--panel); padding: 44px 24px; text-align: center; cursor: pointer;
+    transition: border-color .15s, background .15s;
+  }
+  .drop:hover, .drop.over { border-color: var(--accent); background: var(--surface); }
+  .drop.busy { cursor: default; opacity: .75; }
+  .drop-icon { font-size: 34px; }
+  .drop-main { font-size: 16px; font-weight: 600; margin-top: 10px; }
+  .drop-hint { font-size: 13px; color: var(--muted); margin-top: 5px; }
+  input[type=file] { display: none; }
+
+  .or { text-align: center; font-size: 12px; color: var(--faint); margin: 14px 0 10px; text-transform: uppercase; letter-spacing: .6px; }
+  .url-row { display: flex; gap: 8px; }
+  .url-row input {
+    flex: 1; padding: 10px 12px; border-radius: 9px; border: 1px solid var(--border2);
+    background: var(--panel); color: var(--text); font-size: 14px; font-family: inherit;
+  }
+  button {
+    padding: 10px 16px; border-radius: 9px; border: 0; background: var(--accent); color: var(--accent-text);
+    font-size: 14px; font-weight: 600; font-family: inherit; cursor: pointer;
+  }
+  button:disabled { opacity: .5; cursor: default; }
+  button.ghost { background: transparent; color: var(--text2); border: 1px solid var(--border2); }
+
+  /* ---- progress ---- */
+  .status { margin-top: 20px; background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 16px; display: none; }
+  .status.show { display: block; }
+  .bar { height: 7px; background: var(--surface); border-radius: 99px; overflow: hidden; margin-top: 10px; }
+  .bar > i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .25s; }
+  .status-text { font-size: 14px; font-weight: 500; }
+  .status-note { font-size: 12.5px; color: var(--muted); margin-top: 6px; }
+
+  /* ---- report ---- */
+  /* the nav is position:sticky, so scrollIntoView would tuck the report under it */
+  .report { margin-top: 26px; display: none; scroll-margin-top: 64px; }
+  .report.show { display: block; }
+  .verdict { border-radius: 14px; padding: 18px; border: 1px solid var(--border); background: var(--panel); }
+  .verdict-top { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .pill { font-size: 12px; font-weight: 700; padding: 4px 10px; border-radius: 99px; text-transform: uppercase; letter-spacing: .4px; }
+  .pill.red { background: var(--red-bg); color: var(--red); }
+  .pill.amber { background: var(--amber-bg); color: var(--amber); }
+  .pill.green { background: var(--green-bg); color: var(--green); }
+  .pill.blue { background: var(--blue-bg); color: var(--blue); }
+  .verdict-reason { font-size: 14px; color: var(--text2); margin-top: 10px; line-height: 1.5; }
+  .nurse { margin-top: 14px; border-radius: 10px; padding: 12px 14px; font-size: 13.5px; line-height: 1.5; }
+  .nurse.on { background: var(--amber-bg); color: var(--amber); font-weight: 600; }
+  .nurse.off { background: var(--green-bg); color: var(--green); }
+
+  .sec { margin-top: 20px; background: var(--panel); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
+  .sec > h2 { font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: .5px; color: var(--faint);
+              padding: 13px 16px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; }
+  .sec-body { padding: 6px 16px 14px; }
+  .item { padding: 11px 0; border-bottom: 1px solid var(--border); font-size: 14px; line-height: 1.5; }
+  .item:last-child { border-bottom: 0; }
+  .item-head { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+  .ts { font-size: 12px; color: var(--faint); font-variant-numeric: tabular-nums; flex: 0 0 auto; }
+  .item-note { font-size: 13px; color: var(--muted); margin-top: 4px; }
+  .transcript { font-size: 14px; line-height: 1.65; color: var(--text2); white-space: pre-wrap; }
+  .empty { font-size: 13.5px; color: var(--muted); padding: 10px 0; }
+  video { width: 100%; max-height: 420px; border-radius: 10px; background: #000; margin-top: 4px; }
+
+  /* ---- history ---- */
+  table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+  th { text-align: left; font-size: 11.5px; text-transform: uppercase; letter-spacing: .5px; color: var(--faint); padding: 8px 10px; border-bottom: 1px solid var(--border); font-weight: 700; }
+  td { padding: 9px 10px; border-bottom: 1px solid var(--border); }
+  tr:last-child td { border-bottom: 0; }
+  tbody tr { cursor: pointer; }
+  tbody tr:hover { background: var(--surface); }
+  .err { background: var(--red-bg); color: var(--red); border-radius: 10px; padding: 13px 15px; font-size: 13.5px; margin-top: 16px; line-height: 1.5; display: none; }
+  .err.show { display: block; }
+  @media (max-width: 600px) { .wrap { padding: 20px 14px; } h1 { font-size: 22px; } .hide-sm { display: none; } }
+</style>
+<script defer src="/shared/nav.js"></script>
+</head>
+<body>
+<div class="wrap">
+  <h1>Video Review</h1>
+  <p class="sub">Clinical QA before you publish. Reads the spoken audio <em>and</em> the on-screen captions, then flags anything a nurse needs to look at.</p>
+
+  <div class="drop" id="drop">
+    <div class="drop-icon">🎥</div>
+    <div class="drop-main">Drag a video here, or click to choose one</div>
+    <div class="drop-hint">MP4, MOV, WebM · a 30–60 second clip reviews in about a minute</div>
+    <input type="file" id="file" accept="video/*">
+  </div>
+
+  <div class="or">or paste a direct video link</div>
+  <div class="url-row">
+    <input type="url" id="url" placeholder="https://…/clip.mp4" autocomplete="off">
+    <button id="urlgo">Review</button>
+  </div>
+
+  <div class="status" id="status">
+    <div class="status-text" id="statusText">Working…</div>
+    <div class="bar"><i id="bar"></i></div>
+    <div class="status-note" id="statusNote"></div>
+  </div>
+
+  <div class="err" id="err"></div>
+
+  <div class="report" id="report"></div>
+
+  <div class="sec" style="margin-top:30px">
+    <h2>Recent reviews <span id="histCount"></span></h2>
+    <div class="sec-body" style="padding:0 6px 4px">
+      <table>
+        <thead><tr><th>Video</th><th>Verdict</th><th>Nurse</th><th class="hide-sm">Cost</th><th class="hide-sm">When</th></tr></thead>
+        <tbody id="hist"><tr><td colspan="5" class="empty" style="padding-left:10px">Loading…</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<script>
+const API = "/video-review/api";
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
+
+let busy = false;
+
+function setStatus(text, pct, note) {
+  $("status").classList.add("show");
+  $("statusText").textContent = text;
+  $("bar").style.width = (pct == null ? 0 : pct) + "%";
+  $("statusNote").textContent = note || "";
+}
+function hideStatus() { $("status").classList.remove("show"); }
+function showErr(msg) { $("err").textContent = msg; $("err").classList.add("show"); }
+function clearErr() { $("err").classList.remove("show"); }
+
+// ---- upload: slice the file and send it part by part -----------------------
+async function uploadFile(file) {
+  const start = await fetch(API + "/upload/start", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ filename: file.name, contentType: file.type }),
+  }).then(toJson);
+
+  const partSize = start.partSize;
+  const total = Math.ceil(file.size / partSize);
+  const parts = [];
+  try {
+    for (let i = 0; i < total; i++) {
+      const blob = file.slice(i * partSize, Math.min((i + 1) * partSize, file.size));
+      const q = new URLSearchParams({ key: start.key, uploadId: start.uploadId, part: String(i + 1) });
+      const p = await fetch(API + "/upload/part?" + q, { method: "PUT", body: blob }).then(toJson);
+      parts.push({ partNumber: p.partNumber, etag: p.etag });
+      setStatus("Uploading…", Math.round(((i + 1) / total) * 100), `Part ${i + 1} of ${total}`);
+    }
+    await fetch(API + "/upload/complete", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ key: start.key, uploadId: start.uploadId, parts }),
+    }).then(toJson);
+  } catch (e) {
+    // Don't leave a half-finished multipart upload sitting in R2.
+    fetch(API + "/upload/abort", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ key: start.key, uploadId: start.uploadId }),
+    }).catch(() => {});
+    throw e;
+  }
+  return start.key;
+}
+
+async function toJson(res) {
+  const text = await res.text();
+  let data; try { data = JSON.parse(text); } catch { data = null; }
+  if (!res.ok) throw new Error((data && data.error) || (text || "").slice(0, 200) || ("HTTP " + res.status));
+  return data;
+}
+
+async function runReview(payload, label) {
+  setStatus("Reviewing…", 100, "Gemini is watching the video and reading the captions. Usually under a minute — longer for a long clip.");
+  const out = await fetch(API + "/review", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  }).then(toJson);
+  hideStatus();
+  renderReport(out.review, out.usage, payload.r2Key, label);
+  loadHistory();
+}
+
+async function handleFile(file) {
+  if (busy) return;
+  if (!file.type.startsWith("video/")) { showErr("That doesn't look like a video file."); return; }
+  busy = true; clearErr(); $("drop").classList.add("busy"); $("report").classList.remove("show");
+  try {
+    setStatus("Uploading…", 0, "");
+    const key = await uploadFile(file);
+    await runReview({ r2Key: key, meta: { filename: file.name, title: file.name } }, file.name);
+  } catch (e) {
+    hideStatus(); showErr(e.message || String(e));
+  } finally { busy = false; $("drop").classList.remove("busy"); }
+}
+
+async function handleUrl() {
+  const u = $("url").value.trim();
+  if (!u || busy) return;
+  busy = true; clearErr(); $("urlgo").disabled = true; $("report").classList.remove("show");
+  try {
+    await runReview({ videoUrl: u, meta: { title: u.split("/").pop() } }, u);
+  } catch (e) {
+    hideStatus(); showErr(e.message || String(e));
+  } finally { busy = false; $("urlgo").disabled = false; }
+}
+
+// ---- report ----------------------------------------------------------------
+const VERDICT = {
+  publish: ["green", "Publish"],
+  publish_with_edits: ["blue", "Publish with edits"],
+  revise: ["amber", "Revise"],
+  do_not_publish: ["red", "Do not publish"],
+};
+
+// count is optional — sections like the video player and transcript have no
+// meaningful tally, and rendering a bare "0" there just looks broken.
+function section(title, count, inner) {
+  const badge = typeof count === "number" ? '<span>' + count + '</span>' : '';
+  return '<div class="sec"><h2>' + esc(title) + badge + '</h2><div class="sec-body">' + inner + '</div></div>';
+}
+function list(items, render) {
+  if (!items || !items.length) return '<div class="empty">Nothing flagged.</div>';
+  return items.map(render).join("");
+}
+function confPill(c) {
+  const s = String(c == null ? "unknown" : c).toLowerCase();
+  const cls = s === "high" ? "green" : (s === "medium" ? "amber" : "red");
+  return '<span class="pill ' + cls + '">' + esc(s) + '</span>';
+}
+function accPill(a) {
+  const s = String(a == null ? "unknown" : a).toLowerCase();
+  const cls = s === "accurate" ? "green" : (s === "misleading" ? "amber" : "red");
+  return '<span class="pill ' + cls + '">' + esc(s) + '</span>';
+}
+
+function renderReport(review, usage, r2Key, label) {
+  const o = review.overall || {};
+  const [cls, text] = VERDICT[o.recommendation] || ["blue", o.recommendation || "reviewed"];
+  const nurse = o.needs_human_nurse === true;
+
+  let html = '<div class="verdict">'
+    + '<div class="verdict-top"><span class="pill ' + cls + '">' + esc(text) + '</span>'
+    + '<span style="font-size:14px;font-weight:600">' + esc(label || "") + '</span></div>'
+    + (o.reason ? '<div class="verdict-reason">' + esc(o.reason) + '</div>' : '')
+    + '<div class="nurse ' + (nurse ? "on" : "off") + '">'
+    + (nurse ? '⚕️ Needs a licensed nurse to review before this goes out.'
+             : '✓ No pharmacology content and every clinical claim came back high-confidence — no nurse sign-off required.')
+    + '</div></div>';
+
+  if (r2Key) {
+    html += section("The video", null, '<video controls preload="metadata" src="' + API + '/video/' + encodeURIComponent(r2Key) + '"></video>');
+  }
+
+  const drugs = review.drug_pharmacology_claims || [];
+  html += section("Drug & pharmacology", drugs.length, list(drugs, (d) =>
+    '<div class="item"><div class="item-head"><span class="ts">' + esc(d.timestamp || "—") + '</span>'
+    + '<strong>' + esc(d.drug || "drug") + '</strong>' + accPill(d.accuracy) + confPill(d.confidence)
+    + '<span class="ts">' + esc(d.type || "") + '</span></div>'
+    + '<div>' + esc(d.claim || "") + '</div>'
+    + (d.note ? '<div class="item-note">' + esc(d.note) + '</div>' : '') + '</div>'));
+
+  const flags = review.red_flags || [];
+  html += section("Red flags", flags.length, list(flags, (f) =>
+    '<div class="item"><div class="item-head"><span class="ts">' + esc(f.timestamp || "—") + '</span>'
+    + '<span class="pill ' + (f.severity === "critical" ? "red" : (f.severity === "high" ? "amber" : "blue")) + '">' + esc(f.severity || "flag") + '</span></div>'
+    + '<div>' + esc(f.issue || "") + '</div></div>'));
+
+  const claims = review.clinical_claims || [];
+  html += section("Clinical claims", claims.length, list(claims, (c) =>
+    '<div class="item"><div class="item-head"><span class="ts">' + esc(c.timestamp || "—") + '</span>'
+    + accPill(c.accuracy) + confPill(c.confidence) + '<span class="ts">' + esc(c.source || "") + '</span></div>'
+    + '<div>' + esc(c.claim || "") + '</div>'
+    + (c.note ? '<div class="item-note">' + esc(c.note) + '</div>' : '') + '</div>'));
+
+  const ost = (review.on_screen_text || []).filter((t) => t.issue && String(t.issue).toLowerCase() !== "null");
+  html += section("On-screen text issues", ost.length, list(ost, (t) =>
+    '<div class="item"><div class="item-head"><span class="ts">' + esc(t.timestamp || "—") + '</span>'
+    + '<strong>' + esc(t.text || "") + '</strong></div>'
+    + '<div class="item-note">' + esc(t.issue) + '</div></div>'));
+
+  const sp = review.spelling_grammar || [];
+  html += section("Spelling & grammar", sp.length, list(sp, (s) =>
+    '<div class="item"><div class="item-head"><span class="ts">' + esc(s.timestamp || "—") + '</span>'
+    + '<span class="ts">' + esc(s.location || "") + '</span></div>'
+    + '<div>' + esc(s.text || "") + ' → <strong>' + esc(s.correction || "") + '</strong></div></div>'));
+
+  const pn = review.production_notes || {};
+  const pnKeys = Object.keys(pn).filter((k) => pn[k]);
+  html += section("Production notes", pnKeys.length, pnKeys.length
+    ? pnKeys.map((k) => '<div class="item"><div class="item-head"><strong>' + esc(k.replace(/_/g, " ")) + '</strong></div><div class="item-note">' + esc(pn[k]) + '</div></div>').join("")
+    : '<div class="empty">None.</div>');
+
+  html += section("Transcript", null, '<div class="transcript">' + esc(review.transcript || "(none)") + '</div>');
+
+  if (usage) {
+    html += '<div class="status-note" style="margin-top:14px">'
+      + esc(usage.model) + ' · ' + (usage.input_tokens || 0).toLocaleString() + ' in / '
+      + (usage.output_tokens || 0).toLocaleString() + ' out · about $' + Number(usage.est_cost_usd || 0).toFixed(4)
+      + '</div>';
+  }
+
+  $("report").innerHTML = html;
+  $("report").classList.add("show");
+  $("report").scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+// ---- history ---------------------------------------------------------------
+async function loadHistory() {
+  try {
+    const data = await fetch(API + "/reviews").then(toJson);
+    const rows = data.reviews || [];
+    $("histCount").textContent = rows.length ? rows.length : "";
+    if (!rows.length) {
+      $("hist").innerHTML = '<tr><td colspan="5" class="empty" style="padding-left:10px">No reviews yet.</td></tr>';
+      return;
+    }
+    $("hist").innerHTML = rows.map((r) => {
+      const [cls, text] = VERDICT[r.recommendation] || ["blue", r.recommendation || "—"];
+      const name = (r.video_url || "").split("/").pop() || r.id;
+      return '<tr data-id="' + esc(r.id) + '">'
+        + '<td>' + esc(name.length > 42 ? name.slice(0, 42) + "…" : name) + '</td>'
+        + '<td><span class="pill ' + cls + '">' + esc(text) + '</span></td>'
+        + '<td>' + (r.needs_human_nurse ? '<span class="pill amber">yes</span>' : '<span class="pill green">no</span>') + '</td>'
+        + '<td class="hide-sm">$' + Number(r.est_cost_usd || 0).toFixed(4) + '</td>'
+        + '<td class="hide-sm">' + esc((r.created_at || "").replace("T", " ").slice(0, 16)) + '</td>'
+        + '</tr>';
+    }).join("");
+    Array.prototype.forEach.call($("hist").querySelectorAll("tr[data-id]"), (tr) => {
+      tr.addEventListener("click", () => openReview(tr.getAttribute("data-id")));
+    });
+  } catch (e) {
+    $("hist").innerHTML = '<tr><td colspan="5" class="empty" style="padding-left:10px">Could not load: ' + esc(e.message) + '</td></tr>';
+  }
+}
+
+async function openReview(id) {
+  clearErr();
+  try {
+    const row = await fetch(API + "/reviews/" + encodeURIComponent(id)).then(toJson);
+    renderReport(row.review, null, row.r2_key, (row.video_url || "").split("/").pop());
+  } catch (e) { showErr(e.message); }
+}
+
+// ---- wiring ----------------------------------------------------------------
+const drop = $("drop");
+drop.addEventListener("click", () => { if (!busy) $("file").click(); });
+$("file").addEventListener("change", (e) => { if (e.target.files[0]) handleFile(e.target.files[0]); });
+["dragenter", "dragover"].forEach((ev) => drop.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.add("over"); }));
+["dragleave", "drop"].forEach((ev) => drop.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.remove("over"); }));
+drop.addEventListener("drop", (e) => { const f = e.dataTransfer.files[0]; if (f) handleFile(f); });
+$("urlgo").addEventListener("click", handleUrl);
+$("url").addEventListener("keydown", (e) => { if (e.key === "Enter") handleUrl(); });
+
+loadHistory();
+</script>
+</body>
+</html>

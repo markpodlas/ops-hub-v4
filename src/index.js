@@ -7777,6 +7777,7 @@ export default {
     if (path === "/icp") return Response.redirect(url.origin + "/icp/", 301);
     if (path === "/growth") return Response.redirect(url.origin + "/growth/", 301);
     if (path === "/med-supplies") return Response.redirect(url.origin + "/med-supplies/", 301);
+    if (path === "/video-review") return Response.redirect(url.origin + "/video-review/", 301);
     // ===== LANDING PAGE =====
     if (path === "/" || path === "") { return new Response(landingPageHTML(), { headers: { "Content-Type": "text/html;charset=UTF-8", "X-Robots-Tag": "noindex, nofollow" } }); }
     // ===== AMBASSADOR API =====
@@ -7875,6 +7876,7 @@ body{background:var(--bg);color:var(--text);font-family:'DM Sans',system-ui,-app
     <div class="app-grid">
       <a href="/calendar/" class="app-card"><div class="app-icon">\u{1F4C5}</div><div class="app-text"><div class="app-name">Content Calendar</div><div class="app-desc">Plan &amp; schedule social posts (ClickUp)</div></div></a>
       <a href="/tracker/" class="app-card"><div class="app-icon">\u{1F3AF}</div><div class="app-text"><div class="app-name">Content Tracker</div><div class="app-desc">Instagram performance &amp; scoring</div></div></a>
+      <a href="/video-review/" class="app-card"><div class="app-icon">\u{1F3A5}</div><div class="app-text"><div class="app-name">Video Review</div><div class="app-desc">AI clinical QA before you publish</div></div></a>
       <a href="/social/" class="app-card"><div class="app-icon">\u{1F4F1}</div><div class="app-text"><div class="app-name">Social Attribution</div><div class="app-desc">Tie revenue back to social posts</div></div></a>
       <a href="/stage/" class="app-card"><div class="app-icon">\u{23F1}</div><div class="app-text"><div class="app-name">Stage Timing</div><div class="app-desc">How long tasks sit in each stage</div></div></a>
     </div>

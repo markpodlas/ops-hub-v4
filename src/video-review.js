@@ -19,10 +19,14 @@
 // DB: uses the existing `env.DB` binding (content-calendar). Table self-creates
 //     (see ensureVideoReviewTables) AND has a migration at
 //     migrations/0001_video_reviews.sql — keep the two DDLs in sync.
+// R2: env.VIDEO_REVIEW_UPLOADS (bucket nitm-video-review) holds drag-and-dropped
+//     videos. Read via the BINDING, never over HTTP — the live site sits behind
+//     Cloudflare Access, so a Worker fetching its own URL would hit the login
+//     gate. Videos are kept after review so a nurse can rewatch a flagged moment.
 // SECRET: env.GEMINI_API_KEY   (wrangler secret put — this repo is public)
 // VAR:    env.GEMINI_MODEL     (wrangler.jsonc vars; see MODEL note below)
 //
-// Dependency-free: fetch + D1 only, no SDK.
+// Dependency-free: fetch + D1 + R2 only, no SDK.
 // ============================================================================
 
 const GEMINI_BASE = "https://generativelanguage.googleapis.com";
@@ -32,9 +36,21 @@ const GEMINI_BASE = "https://generativelanguage.googleapis.com";
 // with no code deploy. This constant is only the last-resort fallback.
 const DEFAULT_MODEL = "gemini-2.5-flash";
 
-// Worker memory is 128 MB and we may have to buffer the whole video (see
-// uploadToGemini). Refuse anything that would put us near the ceiling.
-const MAX_VIDEO_BYTES = 100 * 1024 * 1024;
+// Ceiling on a single video. R2-backed uploads stream, so this is about keeping
+// Gemini cost and processing time sane rather than Worker memory; the buffered
+// fallback path (unknown content-length) is the one that actually risks the
+// 128 MB Worker limit.
+const MAX_VIDEO_BYTES = 500 * 1024 * 1024;
+const MAX_BUFFERED_BYTES = 90 * 1024 * 1024;
+
+// Browser slices uploads into parts of this size. R2 multipart requires every
+// part except the last to be identical in size, and at least 5 MB.
+const UPLOAD_PART_BYTES = 10 * 1024 * 1024;
+
+const VIDEO_CONTENT_TYPES = new Set([
+  "video/mp4", "video/quicktime", "video/webm", "video/x-m4v",
+  "video/mpeg", "video/x-matroska", "video/3gpp",
+]);
 
 // File API processing (transcode/index) for a short clip is seconds, but a
 // cold/large upload can take longer. Give up rather than hang the caller.
@@ -42,14 +58,15 @@ const MAX_POLL_MS = 120_000;
 const POLL_INTERVAL_MS = 2_000;
 
 // ----------------------------------------------------------------------------
-// Schema — self-creating. Mirrors migrations/0001_video_reviews.sql exactly;
-// change one, change the other.
+// Schema — self-creating. Mirrors migrations/0001 + 0002 combined; change one,
+// change the other.
 // ----------------------------------------------------------------------------
 async function ensureVideoReviewTables(db) {
   await db.batch([
     db.prepare(`CREATE TABLE IF NOT EXISTS video_reviews (
       id                 TEXT PRIMARY KEY,
-      video_url          TEXT NOT NULL,
+      video_url          TEXT NOT NULL,                   -- source label: the URL, or the uploaded filename
+      r2_key             TEXT,                            -- set when the video was uploaded (kept, so it can be rewatched)
       video_meta         TEXT,                            -- JSON, caller-supplied
       recommendation     TEXT,
       needs_human_nurse  INTEGER NOT NULL DEFAULT 1,      -- fail safe: escalate
@@ -62,6 +79,23 @@ async function ensureVideoReviewTables(db) {
     db.prepare(`CREATE INDEX IF NOT EXISTS idx_video_reviews_created_at ON video_reviews (created_at DESC)`),
     db.prepare(`CREATE INDEX IF NOT EXISTS idx_video_reviews_needs_human ON video_reviews (needs_human_nurse)`),
   ]);
+
+  // Self-migration for tables created before r2_key existed (migration 0001 was
+  // applied before uploads were built). CREATE TABLE IF NOT EXISTS is a no-op on
+  // an existing table, so the column has to be added explicitly. Duplicate-column
+  // errors are expected and harmless — same pattern as initCxAgentTables.
+  try {
+    await db.prepare(`ALTER TABLE video_reviews ADD COLUMN r2_key TEXT`).run();
+  } catch { /* column already there */ }
+}
+
+// Keys come from the client on every upload/playback call, so never trust one:
+// confine them to the uploads/ prefix and reject traversal.
+function badUploadKey(key) {
+  if (!key || typeof key !== "string") return "key is required";
+  if (!key.startsWith("uploads/")) return "bad key";
+  if (key.includes("..")) return "bad key";
+  return null;
 }
 
 // ----------------------------------------------------------------------------
@@ -177,34 +211,52 @@ async function startResumableUpload(apiKey, { bytes, mimeType, displayName }) {
   return uploadUrl;
 }
 
-// Fetch the source video and push it to Gemini. Streams the body straight
-// through when the source told us its length; only buffers when it didn't
-// (the resumable protocol needs the byte count up front).
-async function uploadToGemini(apiKey, videoUrl, mimeTypeHint, displayName) {
+// Resolve the video into { bytes, body, mimeType } regardless of where it came
+// from. The resumable protocol needs the byte count up front, which is why the
+// length matters so much here.
+async function resolveSource(env, { videoUrl, r2Key, mimeType }) {
+  // --- Uploaded file: read straight off the R2 binding. ---
+  // Deliberately NOT over HTTP: the live site is behind Cloudflare Access, so a
+  // Worker fetching its own URL would get the login page instead of the video.
+  // R2 also gives an exact size, so this path always streams.
+  if (r2Key) {
+    if (!env.VIDEO_REVIEW_UPLOADS) throw new Error("VIDEO_REVIEW_UPLOADS (R2) not configured");
+    const obj = await env.VIDEO_REVIEW_UPLOADS.get(r2Key);
+    if (!obj) throw new Error(`Uploaded video not found: ${r2Key}`);
+    if (obj.size === 0) throw new Error("Uploaded video is empty");
+    if (obj.size > MAX_VIDEO_BYTES) throw new Error(`Video is ${obj.size} bytes; limit is ${MAX_VIDEO_BYTES}`);
+    return {
+      bytes: obj.size,
+      body: obj.body,
+      mimeType: mimeType || obj.httpMetadata?.contentType || "video/mp4",
+    };
+  }
+
+  // --- Remote URL: stream when the server declares a length, buffer if not. ---
   const src = await fetch(videoUrl);
   if (!src.ok) throw new Error(`Fetch video -> ${src.status} ${src.statusText}`);
   if (!src.body) throw new Error("Fetch video: empty body");
 
-  const mimeType = mimeTypeHint || src.headers.get("content-type") || "video/mp4";
+  const resolvedMime = mimeType || src.headers.get("content-type") || "video/mp4";
   const declared = parseInt(src.headers.get("content-length") || "", 10);
 
-  let bytes, body;
   if (Number.isFinite(declared) && declared > 0) {
-    if (declared > MAX_VIDEO_BYTES) {
-      throw new Error(`Video is ${declared} bytes; limit is ${MAX_VIDEO_BYTES}`);
-    }
-    bytes = declared;
-    body = src.body;                          // stream through, no buffering
-  } else {
-    const buf = await src.arrayBuffer();      // length unknown — must buffer
-    if (buf.byteLength > MAX_VIDEO_BYTES) {
-      throw new Error(`Video is ${buf.byteLength} bytes; limit is ${MAX_VIDEO_BYTES}`);
-    }
-    bytes = buf.byteLength;
-    body = buf;
+    if (declared > MAX_VIDEO_BYTES) throw new Error(`Video is ${declared} bytes; limit is ${MAX_VIDEO_BYTES}`);
+    return { bytes: declared, body: src.body, mimeType: resolvedMime };
   }
-  if (bytes === 0) throw new Error("Fetch video: zero-length body");
 
+  // Length unknown — we have to buffer it, so the tighter memory-safe cap applies.
+  const buf = await src.arrayBuffer();
+  if (buf.byteLength === 0) throw new Error("Fetch video: zero-length body");
+  if (buf.byteLength > MAX_BUFFERED_BYTES) {
+    throw new Error(`Video is ${buf.byteLength} bytes and the source sent no content-length; the limit in that case is ${MAX_BUFFERED_BYTES}`);
+  }
+  return { bytes: buf.byteLength, body: buf, mimeType: resolvedMime };
+}
+
+// Push an already-resolved source to the Gemini File API.
+async function uploadToGemini(apiKey, source, displayName) {
+  const { bytes, body, mimeType } = source;
   const uploadUrl = await startResumableUpload(apiKey, { bytes, mimeType, displayName });
 
   const res = await fetch(uploadUrl, {
@@ -397,12 +449,13 @@ async function generateReview(apiKey, model, file) {
 // ----------------------------------------------------------------------------
 // Full pipeline: fetch -> upload -> wait ACTIVE -> review -> enforce -> cleanup
 // ----------------------------------------------------------------------------
-async function reviewVideo(env, { videoUrl, mimeType, meta }) {
+async function reviewVideo(env, { videoUrl, r2Key, mimeType, meta }) {
   const apiKey = env.GEMINI_API_KEY;
   const model = env.GEMINI_MODEL || DEFAULT_MODEL;
   const displayName = (meta && (meta.title || meta.name)) || "ops-hub-video-review";
 
-  const uploaded = await uploadToGemini(apiKey, videoUrl, mimeType, String(displayName).slice(0, 120));
+  const source = await resolveSource(env, { videoUrl, r2Key, mimeType });
+  const uploaded = await uploadToGemini(apiKey, source, String(displayName).slice(0, 120));
   try {
     const active = await waitForActive(apiKey, uploaded.name);
     const { review, usage } = await generateReview(apiKey, model, {
@@ -432,14 +485,105 @@ export async function handleVideoReviewAPI(request, env, path) {
   await ensureVideoReviewTables(db);
 
   try {
-    // POST /video-review/api/review  { videoUrl, mimeType?, meta? }
+    // ---- chunked upload (drag-and-drop from the browser) ----------------
+    // Multipart, not one big PUT: video length varies and a single request that
+    // dies at 95% is a miserable way to find out you hit a size ceiling.
+
+    // POST /video-review/api/upload/start  { filename, contentType }
+    if (path === "/video-review/api/upload/start" && request.method === "POST") {
+      if (!env.VIDEO_REVIEW_UPLOADS) return new Response(JSON.stringify({ error: "R2 not configured" }), { status: 500, headers: cors });
+      const b = await request.json().catch(() => ({}));
+      const contentType = String(b.contentType || "").split(";")[0].trim().toLowerCase();
+      if (!VIDEO_CONTENT_TYPES.has(contentType)) {
+        return new Response(JSON.stringify({ error: `unsupported video type: ${contentType || "(none)"}` }), { status: 400, headers: cors });
+      }
+      const safeName = String(b.filename || "video").replace(/[^\w.\-]+/g, "_").slice(-80);
+      const key = `uploads/${crypto.randomUUID()}-${safeName}`;
+      const mpu = await env.VIDEO_REVIEW_UPLOADS.createMultipartUpload(key, { httpMetadata: { contentType } });
+      return new Response(JSON.stringify({ key, uploadId: mpu.uploadId, partSize: UPLOAD_PART_BYTES }), { headers: cors });
+    }
+
+    // PUT /video-review/api/upload/part?key=&uploadId=&part=N   (raw bytes)
+    if (path === "/video-review/api/upload/part" && request.method === "PUT") {
+      if (!env.VIDEO_REVIEW_UPLOADS) return new Response(JSON.stringify({ error: "R2 not configured" }), { status: 500, headers: cors });
+      const q = new URL(request.url).searchParams;
+      const key = q.get("key"), uploadId = q.get("uploadId"), partNumber = parseInt(q.get("part") || "", 10);
+      const keyErr = badUploadKey(key);
+      if (keyErr) return new Response(JSON.stringify({ error: keyErr }), { status: 400, headers: cors });
+      if (!uploadId || !Number.isInteger(partNumber) || partNumber < 1) {
+        return new Response(JSON.stringify({ error: "uploadId and a part number >= 1 are required" }), { status: 400, headers: cors });
+      }
+      const bytes = await request.arrayBuffer();
+      if (bytes.byteLength === 0) return new Response(JSON.stringify({ error: "empty part" }), { status: 400, headers: cors });
+      const mpu = env.VIDEO_REVIEW_UPLOADS.resumeMultipartUpload(key, uploadId);
+      const part = await mpu.uploadPart(partNumber, bytes);
+      return new Response(JSON.stringify({ partNumber: part.partNumber, etag: part.etag }), { headers: cors });
+    }
+
+    // POST /video-review/api/upload/complete  { key, uploadId, parts:[{partNumber, etag}] }
+    if (path === "/video-review/api/upload/complete" && request.method === "POST") {
+      if (!env.VIDEO_REVIEW_UPLOADS) return new Response(JSON.stringify({ error: "R2 not configured" }), { status: 500, headers: cors });
+      const b = await request.json().catch(() => ({}));
+      const keyErr = badUploadKey(b.key);
+      if (keyErr) return new Response(JSON.stringify({ error: keyErr }), { status: 400, headers: cors });
+      if (!b.uploadId || !Array.isArray(b.parts) || b.parts.length === 0) {
+        return new Response(JSON.stringify({ error: "uploadId and a non-empty parts array are required" }), { status: 400, headers: cors });
+      }
+      const mpu = env.VIDEO_REVIEW_UPLOADS.resumeMultipartUpload(b.key, b.uploadId);
+      const obj = await mpu.complete(b.parts.map((p) => ({ partNumber: p.partNumber, etag: p.etag })));
+      return new Response(JSON.stringify({ key: b.key, size: obj.size }), { headers: cors });
+    }
+
+    // POST /video-review/api/upload/abort  { key, uploadId }  — tidy up a cancelled upload
+    if (path === "/video-review/api/upload/abort" && request.method === "POST") {
+      if (!env.VIDEO_REVIEW_UPLOADS) return new Response(JSON.stringify({ error: "R2 not configured" }), { status: 500, headers: cors });
+      const b = await request.json().catch(() => ({}));
+      const keyErr = badUploadKey(b.key);
+      if (keyErr) return new Response(JSON.stringify({ error: keyErr }), { status: 400, headers: cors });
+      try { await env.VIDEO_REVIEW_UPLOADS.resumeMultipartUpload(b.key, b.uploadId).abort(); } catch { /* already gone */ }
+      return new Response(JSON.stringify({ ok: true }), { headers: cors });
+    }
+
+    // GET /video-review/api/video/<key>  — play an uploaded video back.
+    // Served through the Worker so it stays behind Cloudflare Access, same as
+    // the med-supplies images. Range requests so the player can scrub.
+    if (path.startsWith("/video-review/api/video/") && request.method === "GET") {
+      if (!env.VIDEO_REVIEW_UPLOADS) return new Response("R2 not configured", { status: 500 });
+      const key = decodeURIComponent(path.slice("/video-review/api/video/".length));
+      if (badUploadKey(key)) return new Response("bad key", { status: 400 });
+      const range = request.headers.get("Range");
+      const obj = await env.VIDEO_REVIEW_UPLOADS.get(key, range ? { range: request.headers } : undefined);
+      if (!obj) return new Response("not found", { status: 404 });
+      const headers = {
+        "Content-Type": obj.httpMetadata?.contentType || "video/mp4",
+        "Accept-Ranges": "bytes",
+        // private: never let a shared cache hold media that Access protects
+        "Cache-Control": "private, max-age=3600",
+        ...(obj.httpEtag ? { ETag: obj.httpEtag } : {}),
+      };
+      // Only a client that actually sent Range gets a 206. R2 reports a `range`
+      // on full reads too, so keying off the object alone 206s everything.
+      if (range && obj.range && typeof obj.range.offset === "number") {
+        const end = obj.range.offset + (obj.range.length ?? 0) - 1;
+        headers["Content-Range"] = `bytes ${obj.range.offset}-${end}/${obj.size}`;
+        return new Response(obj.body, { status: 206, headers });
+      }
+      return new Response(obj.body, { headers });
+    }
+
+    // POST /video-review/api/review  { videoUrl | r2Key, mimeType?, meta? }
     if (path === "/video-review/api/review" && request.method === "POST") {
       // Validate the caller's request before the server's own config, so a
       // malformed body isn't reported as a config error.
       const body = await request.json().catch(() => ({}));
-      const videoUrl = body.videoUrl;
-      if (!videoUrl || typeof videoUrl !== "string") {
-        return new Response(JSON.stringify({ error: "videoUrl is required" }), { status: 400, headers: cors });
+      const videoUrl = typeof body.videoUrl === "string" ? body.videoUrl : null;
+      const r2Key = typeof body.r2Key === "string" ? body.r2Key : null;
+      if (!videoUrl && !r2Key) {
+        return new Response(JSON.stringify({ error: "videoUrl or r2Key is required" }), { status: 400, headers: cors });
+      }
+      if (r2Key) {
+        const keyErr = badUploadKey(r2Key);
+        if (keyErr) return new Response(JSON.stringify({ error: keyErr }), { status: 400, headers: cors });
       }
       if (!env.GEMINI_API_KEY) {
         return new Response(JSON.stringify({ error: "GEMINI_API_KEY not configured" }), { status: 500, headers: cors });
@@ -447,18 +591,22 @@ export async function handleVideoReviewAPI(request, env, path) {
 
       const { review, usage } = await reviewVideo(env, {
         videoUrl,
+        r2Key,
         mimeType: body.mimeType,
         meta: body.meta,
       });
 
       const id = crypto.randomUUID();
       const needsHumanNurse = review.overall?.needs_human_nurse === true;
+      // Source label: the URL for a link, the original filename for an upload.
+      const sourceLabel = videoUrl || (body.meta && body.meta.filename) || r2Key;
       await db.prepare(`INSERT INTO video_reviews
-          (id, video_url, video_meta, recommendation, needs_human_nurse, review_json, input_tokens, output_tokens, est_cost_usd)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+          (id, video_url, r2_key, video_meta, recommendation, needs_human_nurse, review_json, input_tokens, output_tokens, est_cost_usd)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
         .bind(
           id,
-          videoUrl,
+          sourceLabel,
+          r2Key,
           body.meta ? JSON.stringify(body.meta) : null,
           review.overall?.recommendation ?? null,
           needsHumanNurse ? 1 : 0,
@@ -473,7 +621,7 @@ export async function handleVideoReviewAPI(request, env, path) {
 
     // GET /video-review/api/reviews  — 50 most recent
     if (path === "/video-review/api/reviews" && request.method === "GET") {
-      const result = await db.prepare(`SELECT id, recommendation, needs_human_nurse, est_cost_usd, created_at
+      const result = await db.prepare(`SELECT id, video_url, r2_key, recommendation, needs_human_nurse, est_cost_usd, created_at
         FROM video_reviews ORDER BY created_at DESC LIMIT 50`).all();
       return new Response(JSON.stringify({ reviews: result.results }), { headers: cors });
     }
