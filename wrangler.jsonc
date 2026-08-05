@@ -11,9 +11,11 @@
   // Non-secret config. GEMINI_API_KEY is a SECRET — `npx wrangler secret put
   // GEMINI_API_KEY` (this repo is public; never put the key in this file).
   "vars": {
-    // Video Review module. gemini-2.5-flash RETIRES 2026-10-16 — swapping this
-    // string is the entire migration path, no code change needed.
-    "GEMINI_MODEL": "gemini-2.5-flash"
+    // Video Review module: the DEFAULT model. A model chosen in the UI is saved
+    // in D1 and wins over this, so day-to-day switching needs no deploy.
+    // Google retires Gemini models — and cuts them off for existing keys ahead
+    // of the published date — so treat this as a starting point, not a constant.
+    "GEMINI_MODEL": "gemini-3.6-flash"
   },
   "d1_databases": [
     {

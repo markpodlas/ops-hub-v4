@@ -31,10 +31,16 @@
 
 const GEMINI_BASE = "https://generativelanguage.googleapis.com";
 
-// gemini-2.5-flash RETIRES 2026-10-16. The model is read from env.GEMINI_MODEL
-// (set in wrangler.jsonc) precisely so the migration is a one-line config change
-// with no code deploy. This constant is only the last-resort fallback.
-const DEFAULT_MODEL = "gemini-2.5-flash";
+// Last-resort fallback only. The live order is: model saved in D1 (set from the
+// UI) -> env.GEMINI_MODEL -> this.
+//
+// History worth knowing: this started as gemini-2.5-flash on the strength of its
+// published 2026-10-16 retirement date. Google cut it off well before then —
+// "no longer available to new users", a hard 404 — while STILL listing it in
+// ListModels. So neither the retirement calendar nor the model list can be
+// trusted; only an actual call can. That is why POST /models verifies a model
+// before saving it, and why the choice lives in the database.
+const DEFAULT_MODEL = "gemini-3.6-flash";
 
 // Ceiling on a single video. R2-backed uploads stream, so this is about keeping
 // Gemini cost and processing time sane rather than Worker memory; the buffered
@@ -151,8 +157,11 @@ async function listGeminiModels(apiKey) {
 
   return out
     .filter((m) => (m.supportedGenerationMethods || []).includes("generateContent"))
-    // Drop embedding/vision-only and other non-chat families that can't do this job.
     .filter((m) => /^models\/gemini/.test(m.name || ""))
+    // Drop families that technically expose generateContent but can't do this
+    // job: image generators (Nano Banana), text-to-speech, robotics and
+    // computer-use. Leaving them in makes the dropdown actively misleading.
+    .filter((m) => !/(-image|-tts|robotics|computer-use|embedding)/.test(m.name || ""))
     .map((m) => ({
       id: (m.name || "").replace(/^models\//, ""),
       label: m.displayName || (m.name || "").replace(/^models\//, ""),
@@ -199,6 +208,10 @@ function badUploadKey(key) {
 // Pricing — rough per-MTok estimate, keyed by model-name substring the same way
 // cxModelPricing() does in index.js. Gemini prices video/audio input tiers
 // differently from text, so treat est_cost_usd as a budget signal, not a bill.
+//
+// These rates are Gemini 2.5-era. Now that the model is switchable from the UI,
+// a 3.x model may well bill differently — the figure stays useful for spotting
+// a runaway, but don't reconcile it against an invoice without checking rates.
 // ----------------------------------------------------------------------------
 function geminiPricing(model) {
   const m = (model || "").toLowerCase();
