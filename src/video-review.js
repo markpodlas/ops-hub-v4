@@ -64,6 +64,32 @@ const MAX_POLL_MS = 120_000;
 const POLL_INTERVAL_MS = 2_000;
 
 // ----------------------------------------------------------------------------
+// RAG grounding against the existing nursing textbook corpus.
+//
+// The corpus was built by the qbank project and is reused as-is: 43,990 chunks
+// across 8 titles, embeddings in Vectorize (nitm-textbooks) and passage text in
+// nitm-qbank.textbook_chunks under the same id (e.g. "davis:p1012:c0").
+//
+// EMBEDDING_MODEL must match whatever produced those vectors or retrieval
+// returns noise. Verified empirically by re-embedding a known chunk and
+// checking it comes back top-1: bge-large-en-v1.5 self-matched at 0.91,
+// bge-m3 at 0.055. Do not change this without re-running that check.
+const EMBEDDING_MODEL = "@cf/baai/bge-large-en-v1.5";
+
+// Drug and pharmacology claims are searched against the two pharmacology titles
+// only. Precision matters most here: drug information is the documented weakest
+// area for LLMs, and a med-surg chapter that merely mentions the drug crowds out
+// the drug-guide monograph that actually answers the question.
+const PHARM_BOOKS = ["davisdrug", "ford"];
+
+const RETRIEVE_TOP_K = 5;
+const MAX_PASSAGE_CHARS = 1400;
+// Total passage budget for the grounding call. Passages are spent in relevance
+// order across all claims rather than capped per claim, so a claim with one
+// excellent match isn't padded while a hard one goes hungry.
+const MAX_GROUNDING_CHARS = 60_000;
+
+// ----------------------------------------------------------------------------
 // Schema — self-creating. Mirrors migrations/0001 + 0002 combined; change one,
 // change the other.
 // ----------------------------------------------------------------------------
@@ -209,16 +235,35 @@ function badUploadKey(key) {
 // cxModelPricing() does in index.js. Gemini prices video/audio input tiers
 // differently from text, so treat est_cost_usd as a budget signal, not a bill.
 //
-// These rates are Gemini 2.5-era. Now that the model is switchable from the UI,
-// a 3.x model may well bill differently — the figure stays useful for spotting
-// a runaway, but don't reconcile it against an invoice without checking rates.
+// Rates below are per-model rather than one flat "flash" tier, because the
+// spread is large: 3.6-flash is the flagship at $1.50/$7.50 per MTok, 5x the
+// input cost of 2.5-flash and 6x that of 3.1-flash-lite. A single flash rate
+// understated the model now in use by roughly 4x.
+//
+// Sizing, for reference: a 60s clip is ~18k video tokens (Google documents ~300
+// tokens/second at default media resolution — 258/frame at 1 FPS plus 32/second
+// of audio), so ~20k in and ~1.5k out per review. At 30 videos/month that is
+// ~$1.24 on 3.6-flash or ~$0.22 on 3.1-flash-lite. Either is a rounding error.
 // ----------------------------------------------------------------------------
+// First match wins, so the most specific patterns come first. Rates are per
+// token (published per-1M figures / 1e6), standard tier.
+const GEMINI_PRICES = [
+  [/3\.6-flash/,                        1.50e-6, 7.50e-6],
+  [/3-flash-preview/,                   0.50e-6, 3.00e-6],
+  [/3\.1-flash-lite|3\.5-flash-lite/,   0.25e-6, 1.50e-6],
+  [/2\.5-flash-lite|2\.0-flash-lite/,   0.10e-6, 0.40e-6],
+  [/2\.5-flash|2\.0-flash/,             0.30e-6, 2.50e-6],
+  [/pro/,                               1.25e-6, 10.00e-6],
+];
+
 function geminiPricing(model) {
   const m = (model || "").toLowerCase();
-  if (m.includes("flash-lite")) return { in: 0.10e-6, out: 0.40e-6 };
-  if (m.includes("flash"))      return { in: 0.30e-6, out: 2.50e-6 };
-  if (m.includes("pro"))        return { in: 1.25e-6, out: 10.00e-6 };
-  return { in: 1.25e-6, out: 10.00e-6 }; // safe default = Pro
+  for (const [re, inRate, outRate] of GEMINI_PRICES) {
+    if (re.test(m)) return { in: inRate, out: outRate };
+  }
+  // Unknown model: bill at the most expensive known tier. Over-estimating cost
+  // is the safe direction — an under-estimate hides a runaway.
+  return { in: 1.50e-6, out: 10.00e-6 };
 }
 
 // ----------------------------------------------------------------------------
@@ -492,19 +537,10 @@ function enforceHumanNurse(review) {
 // One multimodal generateContent call.
 // ----------------------------------------------------------------------------
 async function generateReview(apiKey, model, file) {
-  // === RAG GROUNDING HOOK ===========================================
-  // A retrieval layer plugs in HERE, before the request is built. Fetch the
-  // top-k passages from the nursing reference corpus (Vectorize / D1 FTS keyed
-  // off the video's topic or a cheap first-pass transcript), then:
-  //   1. push them as an extra part:
-  //        parts.push({ text: `REFERENCE MATERIAL (cite by [n]):\n${passages}` })
-  //   2. instruct the model in SYSTEM_PROMPT to cite them per claim via a
-  //      `sources: [{ ref: "[2]", quote: "..." }]` field on each claim object
-  //   3. treat an uncited clinical claim as NOT high confidence in
-  //      isHighConfidence() above, so ungrounded assertions still escalate.
-  // Nothing is wired yet — every claim today rests on the model's own
-  // knowledge, which is exactly why enforceHumanNurse() is unconditional.
-  // ==================================================================
+  // Pass 1 is deliberately ungrounded: the model watches the video and reports
+  // what it sees and hears. Grounding happens afterwards, in a separate text-only
+  // pass (see retrievePassages / groundClaims), because the claims have to exist
+  // before there is anything to look up.
   const parts = [
     { fileData: { mimeType: file.mimeType, fileUri: file.uri } },
     { text: USER_INSTRUCTION },
@@ -557,6 +593,238 @@ async function generateReview(apiKey, model, file) {
 }
 
 // ----------------------------------------------------------------------------
+// RAG: retrieve candidate textbook passages for every clinical / drug claim.
+// ----------------------------------------------------------------------------
+
+// Flatten the claims the model produced into a single list to ground.
+function collectClaims(review) {
+  const out = [];
+  const drug = Array.isArray(review.drug_pharmacology_claims) ? review.drug_pharmacology_claims : [];
+  const clinical = Array.isArray(review.clinical_claims) ? review.clinical_claims : [];
+  drug.forEach((c, i) => out.push({
+    ref: `drug:${i}`, kind: "drug", index: i,
+    query: [c?.drug, c?.type, c?.claim].filter(Boolean).join(" — "),
+    claim: c?.claim || "", drug: c?.drug || "", timestamp: c?.timestamp || "",
+  }));
+  clinical.forEach((c, i) => out.push({
+    ref: `clinical:${i}`, kind: "clinical", index: i,
+    query: c?.claim || "",
+    claim: c?.claim || "", timestamp: c?.timestamp || "",
+  }));
+  return out.filter((c) => c.query.trim().length > 0);
+}
+
+async function retrievePassages(env, claims) {
+  if (!env.AI || !env.TEXTBOOKS || !env.QBANK_DB) {
+    throw new Error("grounding bindings not configured (AI / TEXTBOOKS / QBANK_DB)");
+  }
+
+  // One batched embedding call for every claim query.
+  const embedded = await env.AI.run(EMBEDDING_MODEL, {
+    text: claims.map((c) => c.query.slice(0, 2000)),
+  });
+  const vectors = embedded?.data || [];
+
+  // Vectorize queries run concurrently; each claim gets its own hit list.
+  const hitLists = await Promise.all(claims.map(async (c, i) => {
+    const vec = vectors[i];
+    if (!vec) return [];
+    const opts = { topK: RETRIEVE_TOP_K, returnMetadata: true };
+    // Pharmacology claims are restricted to the drug references (see PHARM_BOOKS).
+    if (c.kind === "drug") opts.filter = { book_key: { $in: PHARM_BOOKS } };
+    try {
+      const res = await env.TEXTBOOKS.query(vec, opts);
+      return (res.matches || []).map((m) => ({
+        id: m.id, score: m.score,
+        book: m.metadata?.book || m.metadata?.book_key || "",
+        page: m.metadata?.page ?? null,
+      }));
+    } catch { return []; }
+  }));
+
+  // Fetch passage text for every unique chunk in one round trip.
+  const ids = [...new Set(hitLists.flat().map((h) => h.id))];
+  const textById = new Map();
+  if (ids.length) {
+    const placeholders = ids.map(() => "?").join(",");
+    const rows = await env.QBANK_DB.prepare(
+      `SELECT id, book, page, text FROM textbook_chunks WHERE id IN (${placeholders})`
+    ).bind(...ids).all();
+    for (const r of rows.results || []) textById.set(r.id, r);
+  }
+
+  // Spend the character budget in global relevance order, so the strongest
+  // passages survive regardless of which claim they belong to.
+  const ranked = hitLists
+    .flatMap((hits, i) => hits.map((h) => ({ ...h, claimIdx: i })))
+    .sort((a, b) => (b.score || 0) - (a.score || 0));
+
+  const perClaim = claims.map(() => []);
+  let budget = MAX_GROUNDING_CHARS;
+  for (const h of ranked) {
+    const row = textById.get(h.id);
+    if (!row) continue;
+    const text = String(row.text || "").slice(0, MAX_PASSAGE_CHARS);
+    if (text.length > budget) continue;
+    budget -= text.length;
+    perClaim[h.claimIdx].push({
+      id: h.id,
+      book: row.book || h.book,
+      page: row.page ?? h.page,
+      score: Number((h.score || 0).toFixed(4)),
+      text,
+    });
+  }
+  return perClaim;
+}
+
+// ----------------------------------------------------------------------------
+// RAG pass 2: check each claim against its retrieved passages. Text-only, so
+// the video is not re-uploaded and this call is cheap.
+// ----------------------------------------------------------------------------
+const GROUNDING_SYSTEM_PROMPT = `You are checking claims from a nursing-education video against passages from nursing textbooks.
+
+You will receive numbered claims, each with candidate passages quoted from real textbooks (with book and page).
+
+For EACH claim, decide strictly on the basis of the passages provided:
+  - "supported"     — a passage directly supports the claim. Cite it.
+  - "contradicted"  — a passage directly contradicts the claim. Cite it and give the corrected statement.
+  - "not_addressed" — the passages do not settle it either way.
+
+Rules that matter:
+- Judge ONLY from the passages given. Do NOT fall back on your own knowledge — if the passages don't
+  settle it, the answer is "not_addressed". This is the entire point of the exercise.
+- "not_addressed" is a perfectly good answer and is much safer than a guess. Do not stretch a loosely
+  related passage into support.
+- A passage that mentions the same drug or topic but does not speak to the specific assertion is
+  "not_addressed", not "supported".
+- Quote the exact sentence you relied on, kept short.
+
+Return ONLY valid JSON:
+
+{
+  "claims": [
+    {
+      "ref": "the ref string given to you, verbatim",
+      "verdict": "supported | contradicted | not_addressed",
+      "citations": [ { "id": "chunk id", "book": "book title", "page": 123, "quote": "the exact sentence relied on" } ],
+      "correction": "if contradicted, the correct statement; otherwise empty string",
+      "note": "one short sentence of reasoning"
+    }
+  ]
+}`;
+
+async function groundClaims(apiKey, model, claims, passagesPerClaim) {
+  const blocks = claims.map((c, i) => {
+    const ps = passagesPerClaim[i] || [];
+    const passageText = ps.length
+      ? ps.map((p, n) => `  [${n + 1}] id=${p.id} | ${p.book}, p.${p.page}\n      "${p.text}"`).join("\n")
+      : "  (no passages retrieved)";
+    return `CLAIM ref=${c.ref} (${c.kind}${c.drug ? `, drug: ${c.drug}` : ""}${c.timestamp ? `, at ${c.timestamp}` : ""})\n  "${c.claim}"\n  PASSAGES:\n${passageText}`;
+  }).join("\n\n");
+
+  const res = await fetch(
+    `${GEMINI_BASE}/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        systemInstruction: { parts: [{ text: GROUNDING_SYSTEM_PROMPT }] },
+        contents: [{ role: "user", parts: [{ text: blocks }] }],
+        generationConfig: { temperature: 0.2, responseMimeType: "application/json" },
+      }),
+    }
+  );
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Gemini grounding -> ${res.status}: ${text.slice(0, 300)}`);
+  }
+  const data = await res.json();
+  const text = (data.candidates?.[0]?.content?.parts || []).map((p) => p.text || "").join("");
+  const parsed = extractJson(text);
+  if (!parsed) throw new Error("grounding returned unparseable JSON");
+
+  const u = data.usageMetadata || {};
+  return {
+    byRef: new Map((parsed.claims || []).map((c) => [c.ref, c])),
+    usage: { input_tokens: u.promptTokenCount || 0, output_tokens: u.candidatesTokenCount || 0 },
+  };
+}
+
+// Merge grounding verdicts back onto the claims.
+//
+// The key safety move: a clinical or drug claim that the textbooks contradict or
+// simply don't address is FORCED to low confidence. enforceHumanNurse() then
+// escalates it through the path that is already tested — an ungrounded claim
+// cannot pass as high-confidence just because the model felt sure.
+function applyGrounding(review, claims, passagesPerClaim, byRef) {
+  let supported = 0, contradicted = 0, notAddressed = 0;
+
+  claims.forEach((c, i) => {
+    const target = c.kind === "drug" ? review.drug_pharmacology_claims : review.clinical_claims;
+    const claimObj = target?.[c.index];
+    if (!claimObj || typeof claimObj !== "object") return;
+
+    const g = byRef.get(c.ref);
+    const verdict = g?.verdict || "not_addressed";
+    if (verdict === "supported") supported++;
+    else if (verdict === "contradicted") contradicted++;
+    else notAddressed++;
+
+    claimObj.grounding = {
+      verdict,
+      citations: Array.isArray(g?.citations) ? g.citations : [],
+      correction: g?.correction || "",
+      note: g?.note || "",
+      passages_retrieved: (passagesPerClaim[i] || []).length,
+    };
+
+    if (verdict !== "supported") {
+      claimObj.confidence_before_grounding = claimObj.confidence ?? null;
+      claimObj.confidence = "low";
+    }
+  });
+
+  review.grounding = {
+    corpus: "nitm-textbooks (8 nursing titles, 43,990 passages)",
+    supported, contradicted, not_addressed: notAddressed,
+    checked: claims.length,
+  };
+
+  // Pass 1 set the recommendation before any of this was known. If the textbooks
+  // contradict a claim, leaving a green "publish" next to a contradiction tells
+  // the reviewer two opposite things — and the pill is what they act on.
+  // A contradicted drug claim is a wrong dose or route: that is not "revise".
+  if (contradicted > 0) {
+    const drugContradicted = (Array.isArray(review.drug_pharmacology_claims) ? review.drug_pharmacology_claims : [])
+      .some((c) => c?.grounding?.verdict === "contradicted");
+    downgradeRecommendation(review, drugContradicted ? "do_not_publish" : "revise",
+      drugContradicted
+        ? "A drug or dosage claim is contradicted by the reference library."
+        : "A clinical claim is contradicted by the reference library.");
+  }
+  return review;
+}
+
+// Severity order, least to most serious. Only ever moves toward more caution.
+const RECOMMENDATION_ORDER = ["publish", "publish_with_edits", "revise", "do_not_publish"];
+
+function downgradeRecommendation(review, floor, why) {
+  if (!review.overall || typeof review.overall !== "object") review.overall = {};
+  const current = review.overall.recommendation;
+  const ci = RECOMMENDATION_ORDER.indexOf(current);
+  const fi = RECOMMENDATION_ORDER.indexOf(floor);
+  if (fi < 0) return review;
+  // An unrecognised current value is treated as the mildest, so it still gets
+  // pulled up to the floor rather than being left alone.
+  if (ci >= fi) return review;
+  review.overall.recommendation = floor;
+  review.overall.recommendation_before_grounding = current ?? null;
+  review.overall.reason = review.overall.reason ? `${review.overall.reason} ${why}` : why;
+  return review;
+}
+
+// ----------------------------------------------------------------------------
 // Full pipeline: fetch -> upload -> wait ACTIVE -> review -> enforce -> cleanup
 // ----------------------------------------------------------------------------
 async function reviewVideo(env, db, { videoUrl, r2Key, mimeType, meta }) {
@@ -572,6 +840,35 @@ async function reviewVideo(env, db, { videoUrl, r2Key, mimeType, meta }) {
       uri: active.uri || uploaded.uri,
       mimeType: active.mimeType || uploaded.mimeType,
     });
+
+    // --- RAG grounding pass -------------------------------------------------
+    // Pass 1 above judged claims from the model's own knowledge. This second,
+    // text-only pass re-checks every clinical and drug claim against the nursing
+    // textbook corpus, and anything the books don't support is knocked down to
+    // low confidence so the nurse gate catches it.
+    const claims = collectClaims(review);
+    if (claims.length && env.TEXTBOOKS && env.QBANK_DB && env.AI) {
+      try {
+        const passages = await retrievePassages(env, claims);
+        const { byRef, usage: gUsage } = await groundClaims(apiKey, model, claims, passages);
+        applyGrounding(review, claims, passages, byRef);
+        usage.grounding_input_tokens = gUsage.input_tokens;
+        usage.grounding_output_tokens = gUsage.output_tokens;
+        const p = geminiPricing(model);
+        usage.est_cost_usd += gUsage.input_tokens * p.in + gUsage.output_tokens * p.out;
+        usage.input_tokens += gUsage.input_tokens;
+        usage.output_tokens += gUsage.output_tokens;
+      } catch (e) {
+        // Grounding is a safety net, not a gate. If it fails we still return the
+        // review — and because enforceHumanNurse() escalates all pharmacology and
+        // anything below high confidence regardless, a grounding failure can only
+        // ever make the outcome MORE cautious, never less.
+        review.grounding = { error: e.message, checked: 0 };
+      }
+    } else if (claims.length) {
+      review.grounding = { error: "grounding not configured", checked: 0 };
+    }
+
     return { review: enforceHumanNurse(review), usage };
   } finally {
     await deleteGeminiFile(apiKey, uploaded.name);

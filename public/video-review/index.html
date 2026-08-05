@@ -82,6 +82,13 @@
   .ts { font-size: 12px; color: var(--faint); font-variant-numeric: tabular-nums; flex: 0 0 auto; }
   .item-note { font-size: 13px; color: var(--muted); margin-top: 4px; }
   .transcript { font-size: 14px; line-height: 1.65; color: var(--text2); white-space: pre-wrap; }
+  /* ---- textbook grounding ---- */
+  .ground-summary { margin-top: 10px; font-size: 12.5px; color: var(--muted); line-height: 1.45; }
+  .ground-summary.bad { color: var(--amber); font-weight: 600; }
+  .correction { margin-top: 6px; font-size: 13.5px; line-height: 1.5; background: var(--red-bg); color: var(--red);
+                border-radius: 8px; padding: 8px 10px; }
+  .cite { margin-top: 5px; font-size: 12.5px; color: var(--muted); line-height: 1.45;
+          border-left: 2px solid var(--border2); padding-left: 9px; }
   .empty { font-size: 13.5px; color: var(--muted); padding: 10px 0; }
   video { width: 100%; max-height: 420px; border-radius: 10px; background: #000; margin-top: 4px; }
 
@@ -279,6 +286,51 @@ function accPill(a) {
   return '<span class="pill ' + cls + '">' + esc(s) + '</span>';
 }
 
+// Textbook grounding for a single claim: the verdict, the correction if the books
+// disagree, and the passages actually relied on (book + page, short quote).
+const GVERDICT = {
+  supported:     ["green", "textbook ✓"],
+  contradicted:  ["red",   "textbook ✗"],
+  not_addressed: ["amber", "not in textbooks"],
+};
+function groundPill(g) {
+  if (!g || !g.verdict) return "";
+  const [cls, label] = GVERDICT[g.verdict] || ["amber", g.verdict];
+  return '<span class="pill ' + cls + '">' + esc(label) + '</span>';
+}
+function groundBlock(g) {
+  if (!g || !g.verdict) return "";
+  let h = "";
+  if (g.correction) h += '<div class="correction"><strong>Per the textbooks:</strong> ' + esc(g.correction) + '</div>';
+  if (g.note) h += '<div class="item-note">' + esc(g.note) + '</div>';
+  (g.citations || []).forEach((c) => {
+    h += '<div class="cite">' + esc(c.book || "") + (c.page ? ', p.' + esc(c.page) : "")
+       + (c.quote ? ' — <em>“' + esc(String(c.quote).slice(0, 260)) + '”</em>' : "") + '</div>';
+  });
+  if (g.verdict === "not_addressed" && !(g.citations || []).length) {
+    h += '<div class="item-note">Nothing in the reference library settles this either way — treated as low confidence.</div>';
+  }
+  return h;
+}
+
+// One line under the verdict saying how the claims fared against the library —
+// and saying so plainly if grounding didn't run, rather than implying it did.
+function groundSummary(g) {
+  if (!g) return "";
+  if (g.error) {
+    return '<div class="ground-summary bad">⚠ Textbook grounding did not run (' + esc(g.error)
+      + '). Claims reflect the model\'s own knowledge only, so treat them with more caution.</div>';
+  }
+  if (!g.checked) return "";
+  const bits = [];
+  if (g.supported) bits.push(g.supported + " confirmed");
+  if (g.contradicted) bits.push(g.contradicted + " contradicted");
+  if (g.not_addressed) bits.push(g.not_addressed + " not found");
+  return '<div class="ground-summary">Checked ' + g.checked + ' claim'
+    + (g.checked === 1 ? "" : "s") + ' against ' + esc(g.corpus || "the reference library")
+    + (bits.length ? ' — ' + esc(bits.join(", ")) : "") + '.</div>';
+}
+
 function renderReport(review, usage, r2Key, label) {
   const o = review.overall || {};
   const [cls, text] = VERDICT[o.recommendation] || ["blue", o.recommendation || "reviewed"];
@@ -291,7 +343,9 @@ function renderReport(review, usage, r2Key, label) {
     + '<div class="nurse ' + (nurse ? "on" : "off") + '">'
     + (nurse ? '⚕️ Needs a licensed nurse to review before this goes out.'
              : '✓ No pharmacology content and every clinical claim came back high-confidence — no nurse sign-off required.')
-    + '</div></div>';
+    + '</div>'
+    + groundSummary(review.grounding)
+    + '</div>';
 
   if (r2Key) {
     html += section("The video", null, '<video controls preload="metadata" src="' + API + '/video/' + encodeURIComponent(r2Key) + '"></video>');
@@ -301,9 +355,11 @@ function renderReport(review, usage, r2Key, label) {
   html += section("Drug & pharmacology", drugs.length, list(drugs, (d) =>
     '<div class="item"><div class="item-head"><span class="ts">' + esc(d.timestamp || "—") + '</span>'
     + '<strong>' + esc(d.drug || "drug") + '</strong>' + accPill(d.accuracy) + confPill(d.confidence)
+    + groundPill(d.grounding)
     + '<span class="ts">' + esc(d.type || "") + '</span></div>'
     + '<div>' + esc(d.claim || "") + '</div>'
-    + (d.note ? '<div class="item-note">' + esc(d.note) + '</div>' : '') + '</div>'));
+    + (d.note ? '<div class="item-note">' + esc(d.note) + '</div>' : '')
+    + groundBlock(d.grounding) + '</div>'));
 
   const flags = review.red_flags || [];
   html += section("Red flags", flags.length, list(flags, (f) =>
@@ -314,9 +370,11 @@ function renderReport(review, usage, r2Key, label) {
   const claims = review.clinical_claims || [];
   html += section("Clinical claims", claims.length, list(claims, (c) =>
     '<div class="item"><div class="item-head"><span class="ts">' + esc(c.timestamp || "—") + '</span>'
-    + accPill(c.accuracy) + confPill(c.confidence) + '<span class="ts">' + esc(c.source || "") + '</span></div>'
+    + accPill(c.accuracy) + confPill(c.confidence) + groundPill(c.grounding)
+    + '<span class="ts">' + esc(c.source || "") + '</span></div>'
     + '<div>' + esc(c.claim || "") + '</div>'
-    + (c.note ? '<div class="item-note">' + esc(c.note) + '</div>' : '') + '</div>'));
+    + (c.note ? '<div class="item-note">' + esc(c.note) + '</div>' : '')
+    + groundBlock(c.grounding) + '</div>'));
 
   const ost = (review.on_screen_text || []).filter((t) => t.issue && String(t.issue).toLowerCase() !== "null");
   html += section("On-screen text issues", ost.length, list(ost, (t) =>

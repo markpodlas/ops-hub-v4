@@ -27,6 +27,13 @@
       "binding": "CX_AGENT_DB",
       "database_name": "cx-agent",
       "database_id": "47d05b88-dfae-4755-a52e-3115ab6d09ff"
+    },
+    {
+      // READ-ONLY. Owned by the qbank project; holds textbook_chunks.text, the
+      // passages Vectorize ids point at. Never write to this from ops-hub.
+      "binding": "QBANK_DB",
+      "database_name": "nitm-qbank",
+      "database_id": "5d018ddd-a9ed-48c4-89f3-1db05a6bd6b0"
     }
   ],
   "r2_buckets": [
@@ -43,6 +50,21 @@
       "bucket_name": "nitm-video-review"
     }
   ],
+  // RAG grounding for Video Review. The nursing textbook corpus already exists,
+  // built by the qbank project: 43,990 embedded chunks across 8 titles
+  // (including Davis's Drug Guide and Ford's Clinical Pharmacology).
+  // Vectorize holds the embeddings + citation metadata; the passage TEXT lives in
+  // nitm-qbank.textbook_chunks, keyed by the same id. Both are READ-ONLY here —
+  // ops-hub must never write to the qbank database.
+  "vectorize": [
+    {
+      "binding": "TEXTBOOKS",
+      "index_name": "nitm-textbooks"
+    }
+  ],
+  "ai": {
+    "binding": "AI"
+  },
   "triggers": {
     "crons": ["*/2 * * * *"]
   }
