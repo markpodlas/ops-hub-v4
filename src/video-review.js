@@ -53,6 +53,10 @@ const MAX_BUFFERED_BYTES = 90 * 1024 * 1024;
 // part except the last to be identical in size, and at least 5 MB.
 const UPLOAD_PART_BYTES = 10 * 1024 * 1024;
 
+// Chunk size for the R2 -> Gemini leg. Must be a multiple of 256 KiB for
+// intermediate chunks of a resumable upload.
+const GEMINI_UPLOAD_CHUNK_BYTES = 8 * 1024 * 1024;
+
 const VIDEO_CONTENT_TYPES = new Set([
   "video/mp4", "video/quicktime", "video/webm", "video/x-m4v",
   "video/mpeg", "video/x-matroska", "video/3gpp",
@@ -376,14 +380,22 @@ async function resolveSource(env, { videoUrl, r2Key, mimeType }) {
   // R2 also gives an exact size, so this path always streams.
   if (r2Key) {
     if (!env.VIDEO_REVIEW_UPLOADS) throw new Error("VIDEO_REVIEW_UPLOADS (R2) not configured");
-    const obj = await env.VIDEO_REVIEW_UPLOADS.get(r2Key);
-    if (!obj) throw new Error(`Uploaded video not found: ${r2Key}`);
-    if (obj.size === 0) throw new Error("Uploaded video is empty");
-    if (obj.size > MAX_VIDEO_BYTES) throw new Error(`Video is ${obj.size} bytes; limit is ${MAX_VIDEO_BYTES}`);
+    const head = await env.VIDEO_REVIEW_UPLOADS.head(r2Key);
+    if (!head) throw new Error(`Uploaded video not found: ${r2Key}`);
+    if (head.size === 0) throw new Error("Uploaded video is empty");
+    if (head.size > MAX_VIDEO_BYTES) throw new Error(`Video is ${head.size} bytes; limit is ${MAX_VIDEO_BYTES}`);
     return {
-      bytes: obj.size,
-      body: obj.body,
-      mimeType: mimeType || obj.httpMetadata?.contentType || "video/mp4",
+      bytes: head.size,
+      mimeType: mimeType || head.httpMetadata?.contentType || "video/mp4",
+      // Ranged reader instead of one long stream. Piping a ~100 MB R2 body
+      // straight into the Gemini upload fails intermittently with "Network
+      // connection lost", and every one of these videos is that size, so the
+      // upload is done in bounded chunks instead. See uploadToGemini.
+      readRange: async (offset, length) => {
+        const part = await env.VIDEO_REVIEW_UPLOADS.get(r2Key, { range: { offset, length } });
+        if (!part) throw new Error(`R2 range read failed at offset ${offset}`);
+        return await part.arrayBuffer();
+      },
     };
   }
 
@@ -410,22 +422,52 @@ async function resolveSource(env, { videoUrl, r2Key, mimeType }) {
 }
 
 // Push an already-resolved source to the Gemini File API.
+//
+// Two paths. If the source can be read in ranges (R2), the bytes go up in bounded
+// chunks — a single ~100 MB stream to the upload endpoint drops connections often
+// enough to be useless, and every real video here is that size. Otherwise (a
+// remote URL, where ranged reads aren't guaranteed) fall back to one stream.
 async function uploadToGemini(apiKey, source, displayName) {
-  const { bytes, body, mimeType } = source;
+  const { bytes, body, mimeType, readRange } = source;
   const uploadUrl = await startResumableUpload(apiKey, { bytes, mimeType, displayName });
 
-  const res = await fetch(uploadUrl, {
-    method: "POST",
-    headers: {
-      "Content-Length": String(bytes),
-      "X-Goog-Upload-Offset": "0",
-      "X-Goog-Upload-Command": "upload, finalize",
-    },
-    body,
-  });
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Gemini upload -> ${res.status}: ${text.slice(0, 300)}`);
+  let res;
+  if (typeof readRange === "function") {
+    let offset = 0;
+    while (offset < bytes) {
+      const length = Math.min(GEMINI_UPLOAD_CHUNK_BYTES, bytes - offset);
+      const chunk = await readRange(offset, length);
+      const last = offset + length >= bytes;
+      res = await fetch(uploadUrl, {
+        method: "POST",
+        headers: {
+          "Content-Length": String(length),
+          "X-Goog-Upload-Offset": String(offset),
+          // Only the final chunk finalizes; the rest just extend the session.
+          "X-Goog-Upload-Command": last ? "upload, finalize" : "upload",
+        },
+        body: chunk,
+      });
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(`Gemini upload chunk at ${offset} -> ${res.status}: ${text.slice(0, 300)}`);
+      }
+      offset += length;
+    }
+  } else {
+    res = await fetch(uploadUrl, {
+      method: "POST",
+      headers: {
+        "Content-Length": String(bytes),
+        "X-Goog-Upload-Offset": "0",
+        "X-Goog-Upload-Command": "upload, finalize",
+      },
+      body,
+    });
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(`Gemini upload -> ${res.status}: ${text.slice(0, 300)}`);
+    }
   }
   const data = await res.json();
   const file = data.file || data;
@@ -751,6 +793,53 @@ async function groundClaims(apiKey, model, claims, passagesPerClaim) {
   };
 }
 
+// Normalise for quote matching: collapse whitespace, drop punctuation, lowercase.
+// Textbook OCR is full of odd spacing and stray hyphens, so an exact string
+// compare would reject quotes that are genuinely present.
+function normaliseQuote(s) {
+  return String(s || "").toLowerCase().replace(/[^a-z0-9 ]+/g, " ").replace(/\s+/g, " ").trim();
+}
+
+// Verify each citation against the passages that were actually retrieved.
+//
+// Without this, "supported" rests on the model's word: it could cite a page it
+// was never shown, or paraphrase a quote that doesn't exist. Both are exactly
+// the failure this whole feature exists to prevent, so both are checked
+// mechanically rather than trusted:
+//   1. the cited chunk id must be one we actually put in front of the model
+//   2. the quoted sentence must really appear in that chunk's text
+// A citation failing either check is dropped and recorded. If a "supported"
+// verdict loses every citation, it is demoted to not_addressed — which forces
+// low confidence and escalates to the nurse.
+function verifyCitations(grounding, passages) {
+  const byId = new Map((passages || []).map((p) => [p.id, normaliseQuote(p.text)]));
+  const kept = [], rejected = [];
+
+  for (const c of grounding.citations || []) {
+    const haystack = byId.get(c?.id);
+    if (!haystack) { rejected.push({ ...c, why: "cited a passage that was never retrieved" }); continue; }
+    const needle = normaliseQuote(c?.quote);
+    if (!needle) { kept.push({ ...c, verified: false, why: "no quote given" }); continue; }
+    // Match on a prefix: models routinely truncate a long sentence, and the
+    // passage itself is capped at MAX_PASSAGE_CHARS so the tail may be cut off.
+    const probe = needle.length > 40 ? needle.slice(0, 40) : needle;
+    if (haystack.includes(probe)) kept.push({ ...c, verified: true });
+    else rejected.push({ ...c, why: "quote not found in the cited passage" });
+  }
+
+  grounding.citations = kept;
+  if (rejected.length) grounding.rejected_citations = rejected;
+
+  const anyVerified = kept.some((c) => c.verified);
+  if (grounding.verdict === "supported" && !anyVerified) {
+    grounding.verdict = "not_addressed";
+    grounding.demoted_from = "supported";
+    grounding.note = (grounding.note ? grounding.note + " " : "")
+      + "Demoted: no citation could be verified against the retrieved passages.";
+  }
+  return grounding;
+}
+
 // Merge grounding verdicts back onto the claims.
 //
 // The key safety move: a clinical or drug claim that the textbooks contradict or
@@ -766,20 +855,24 @@ function applyGrounding(review, claims, passagesPerClaim, byRef) {
     if (!claimObj || typeof claimObj !== "object") return;
 
     const g = byRef.get(c.ref);
-    const verdict = g?.verdict || "not_addressed";
-    if (verdict === "supported") supported++;
-    else if (verdict === "contradicted") contradicted++;
-    else notAddressed++;
-
-    claimObj.grounding = {
-      verdict,
+    const grounding = {
+      verdict: g?.verdict || "not_addressed",
       citations: Array.isArray(g?.citations) ? g.citations : [],
       correction: g?.correction || "",
       note: g?.note || "",
       passages_retrieved: (passagesPerClaim[i] || []).length,
     };
 
-    if (verdict !== "supported") {
+    // Verify BEFORE counting or adjusting confidence — verification can demote a
+    // "supported" verdict, and the tallies and the nurse gate must reflect that.
+    verifyCitations(grounding, passagesPerClaim[i]);
+    claimObj.grounding = grounding;
+
+    if (grounding.verdict === "supported") supported++;
+    else if (grounding.verdict === "contradicted") contradicted++;
+    else notAddressed++;
+
+    if (grounding.verdict !== "supported") {
       claimObj.confidence_before_grounding = claimObj.confidence ?? null;
       claimObj.confidence = "low";
     }
