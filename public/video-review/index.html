@@ -150,6 +150,22 @@
       <button id="modelSave" disabled>Use this</button>
     </div>
     <div class="model-note" id="modelNote">Checking which models your API key can use…</div>
+    <div class="model-row" style="margin-top:12px">
+      <span class="model-label">Detail</span>
+      <select id="fps" style="min-width:150px">
+        <option value="1">1 frame/sec (default)</option>
+        <option value="2">2 frames/sec</option>
+        <option value="3">3 frames/sec</option>
+        <option value="5">5 frames/sec</option>
+      </select>
+      <select id="resolution" style="min-width:150px">
+        <option value="default">Standard resolution</option>
+        <option value="high">High resolution</option>
+        <option value="low">Low (cheapest)</option>
+      </select>
+      <button id="fidSave" class="ghost">Save</button>
+    </div>
+    <div class="model-note" id="fidNote">More frames and higher resolution catch fast captions and technique detail, and cost proportionally more.</div>
   </div>
 
   <div class="report" id="report"></div>
@@ -351,6 +367,19 @@ function renderReport(review, usage, r2Key, label) {
     html += section("The video", null, '<video controls preload="metadata" src="' + API + '/video/' + encodeURIComponent(r2Key) + '"></video>');
   }
 
+  // What the video SHOWS, as opposed to what it says. Sits above the spoken
+  // claims because a demonstrated error is invisible to every other section.
+  const vt = review.visual_technique || [];
+  const CONCERN = { significant: "red", minor: "amber", none: "green" };
+  html += section("What the video shows", vt.length, list(vt, (v) => {
+    const c = String(v.concern || "none").toLowerCase();
+    return '<div class="item"><div class="item-head"><span class="ts">' + esc(v.timestamp || "—") + '</span>'
+      + '<span class="pill ' + (CONCERN[c] || "blue") + '">' + esc(c) + '</span></div>'
+      + '<div>' + esc(v.observation || "") + '</div>'
+      + (v.shown_vs_said ? '<div class="correction"><strong>Said vs. shown:</strong> ' + esc(v.shown_vs_said) + '</div>' : '')
+      + (v.note ? '<div class="item-note">' + esc(v.note) + '</div>' : '') + '</div>';
+  }));
+
   const drugs = review.drug_pharmacology_claims || [];
   html += section("Drug & pharmacology", drugs.length, list(drugs, (d) =>
     '<div class="item"><div class="item-head"><span class="ts">' + esc(d.timestamp || "—") + '</span>'
@@ -502,6 +531,35 @@ async function saveModel() {
   } finally { save.disabled = false; }
 }
 
+// ---- how much of the video the model sees -----------------------------------
+async function loadFidelity() {
+  try {
+    const d = await fetch(API + "/fidelity").then(toJson);
+    $("fps").value = String(d.fps);
+    $("resolution").value = d.resolution;
+    $("fidNote").textContent = "Currently " + d.fps + " frame" + (d.fps === 1 ? "" : "s")
+      + "/sec at " + d.resolution + " resolution. More frames catch fast captions and technique detail, and cost proportionally more.";
+    $("fidNote").className = "model-note";
+  } catch (e) {
+    $("fidNote").textContent = e.message;
+    $("fidNote").className = "model-note bad";
+  }
+}
+async function saveFidelity() {
+  $("fidSave").disabled = true;
+  try {
+    const d = await fetch(API + "/fidelity", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ fps: Number($("fps").value), resolution: $("resolution").value }),
+    }).then(toJson);
+    $("fidNote").textContent = "✓ Saved — now " + d.fps + " frame" + (d.fps === 1 ? "" : "s") + "/sec at " + d.resolution + " resolution.";
+    $("fidNote").className = "model-note ok";
+  } catch (e) {
+    $("fidNote").textContent = e.message;
+    $("fidNote").className = "model-note bad";
+  } finally { $("fidSave").disabled = false; }
+}
+
 // ---- wiring ----------------------------------------------------------------
 const drop = $("drop");
 drop.addEventListener("click", () => { if (!busy) $("file").click(); });
@@ -512,8 +570,10 @@ drop.addEventListener("drop", (e) => { const f = e.dataTransfer.files[0]; if (f)
 $("urlgo").addEventListener("click", handleUrl);
 $("url").addEventListener("keydown", (e) => { if (e.key === "Enter") handleUrl(); });
 $("modelSave").addEventListener("click", saveModel);
+$("fidSave").addEventListener("click", saveFidelity);
 
 loadModels();
+loadFidelity();
 loadHistory();
 </script>
 </body>

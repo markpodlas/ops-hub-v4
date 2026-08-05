@@ -164,6 +164,30 @@ async function resolveModel(db, env) {
   return (await getConfig(db, "model")) || env.GEMINI_MODEL || DEFAULT_MODEL;
 }
 
+// How much of the video the model actually sees.
+//
+// Gemini samples 1 frame per second at ~258 tokens/frame by default (~300 tokens
+// per second of video all in). Raising either costs proportionally more, which at
+// this volume is pennies — a 60s clip is well under $0.10 even at 2 FPS + high.
+// Worth it for burned-in captions that flash by and for judging technique.
+const ALLOWED_FPS = [1, 2, 3, 5];
+const ALLOWED_RESOLUTION = ["default", "low", "high"];
+
+async function resolveFidelity(db) {
+  const rawFps = parseFloat(await getConfig(db, "video_fps"));
+  const fps = ALLOWED_FPS.includes(rawFps) ? rawFps : 1;
+  const raw = (await getConfig(db, "media_resolution")) || "default";
+  const resolution = ALLOWED_RESOLUTION.includes(raw) ? raw : "default";
+  return { fps, resolution };
+}
+
+// Gemini wants the enum form; "default" means send nothing at all.
+function mediaResolutionEnum(resolution) {
+  if (resolution === "low") return "MEDIA_RESOLUTION_LOW";
+  if (resolution === "high") return "MEDIA_RESOLUTION_HIGH";
+  return null;
+}
+
 // Ask Gemini what this API key can actually use, rather than hardcoding a list
 // that rots. Filtered to models that support generateContent and can take video.
 async function listGeminiModels(apiKey) {
@@ -317,6 +341,15 @@ Return ONLY valid JSON matching exactly this shape:
   "spelling_grammar": [
     { "text": "the erroneous text", "location": "on_screen | narration", "timestamp": "M:SS", "correction": "the fix" }
   ],
+  "visual_technique": [
+    {
+      "observation": "what is actually DONE or SHOWN on screen, described plainly",
+      "timestamp": "M:SS",
+      "shown_vs_said": "if the narration and the visuals disagree, state both; otherwise empty string",
+      "concern": "none | minor | significant",
+      "note": "why it matters, and what correct practice looks like"
+    }
+  ],
   "production_notes": {
     "audio_quality": "brief note on clarity, levels, background noise",
     "pacing": "brief note",
@@ -335,6 +368,14 @@ Return ONLY valid JSON matching exactly this shape:
 }
 
 Rules:
+- visual_technique is for what is DEMONSTRATED, not what is said. Nursing procedure can be narrated
+  perfectly while being performed wrongly, and that error exists only in the picture. Watch for:
+  hand hygiene and glove technique, PPE, injection site / angle / needle handling, sharps and
+  disposal, sterile field breaks, equipment set up or used incorrectly, device shown that is not the
+  device described, landmarks and positioning, anything a nurse educator would stop the camera for.
+  If the demonstration is sound, say so with concern "none" rather than inventing faults.
+- Any disagreement between what is SAID and what is SHOWN is significant — put it in
+  visual_technique with both sides filled in, and add a red_flag if it could mislead a student.
 - ANY mention of a drug, dose, route, frequency, or interaction goes in drug_pharmacology_claims, even if it is correct.
 - Set overall.needs_human_nurse to true whenever there is any pharmacology content at all, or any
   clinical claim you rated below "high" confidence. When in doubt, set it to true.
@@ -540,6 +581,26 @@ function isHighConfidence(value) {
   return false;                                    // missing/unknown => not high
 }
 
+// Visual findings the model rated "significant". Anything unparseable is ignored
+// here rather than treated as significant — unlike confidence, a missing value
+// means "not reported", not "reported as bad", and the pharmacology and
+// confidence gates already carry the fail-safe burden.
+function significantVisualConcerns(review) {
+  const vt = Array.isArray(review?.visual_technique) ? review.visual_technique : [];
+  return vt.filter((v) => String(v?.concern || "").trim().toLowerCase() === "significant");
+}
+
+// A significant demonstrated error means the video needs re-shooting or editing,
+// so the recommendation cannot stay at "publish".
+function applyVisualConcerns(review) {
+  const serious = significantVisualConcerns(review);
+  if (serious.length > 0) {
+    downgradeRecommendation(review, "revise",
+      `${serious.length} significant issue(s) in what the video demonstrates on screen.`);
+  }
+  return review;
+}
+
 function enforceHumanNurse(review) {
   if (!review.overall || typeof review.overall !== "object") review.overall = {};
 
@@ -564,6 +625,14 @@ function enforceHumanNurse(review) {
     }
   }
 
+  // Demonstrated errors count too. A procedure narrated correctly but performed
+  // wrongly is exactly the failure a text-only check cannot see, so a significant
+  // visual concern escalates on the same footing as a shaky clinical claim.
+  const seriousVisual = significantVisualConcerns(review);
+  if (seriousVisual.length > 0) {
+    reasons.push(`${seriousVisual.length} significant visual/technique concern(s)`);
+  }
+
   if (reasons.length > 0) {
     review.overall.needs_human_nurse = true;
     // Tell the reviewer why this landed on their desk.
@@ -578,15 +647,20 @@ function enforceHumanNurse(review) {
 // ----------------------------------------------------------------------------
 // One multimodal generateContent call.
 // ----------------------------------------------------------------------------
-async function generateReview(apiKey, model, file) {
+async function generateReview(apiKey, model, file, fidelity = { fps: 1, resolution: "default" }) {
   // Pass 1 is deliberately ungrounded: the model watches the video and reports
   // what it sees and hears. Grounding happens afterwards, in a separate text-only
   // pass (see retrievePassages / groundClaims), because the claims have to exist
   // before there is anything to look up.
-  const parts = [
-    { fileData: { mimeType: file.mimeType, fileUri: file.uri } },
-    { text: USER_INSTRUCTION },
-  ];
+  const filePart = { fileData: { mimeType: file.mimeType, fileUri: file.uri } };
+  // Only send fps when it differs from the API default, so a plain request stays
+  // byte-identical to what has already been proven to work.
+  if (fidelity.fps && fidelity.fps !== 1) filePart.videoMetadata = { fps: fidelity.fps };
+  const parts = [filePart, { text: USER_INSTRUCTION }];
+
+  const genCfg = { temperature: 0.2, responseMimeType: "application/json" };
+  const resEnum = mediaResolutionEnum(fidelity.resolution);
+  if (resEnum) genCfg.mediaResolution = resEnum;
 
   const res = await fetch(
     `${GEMINI_BASE}/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`,
@@ -596,10 +670,7 @@ async function generateReview(apiKey, model, file) {
       body: JSON.stringify({
         systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
         contents: [{ role: "user", parts }],
-        generationConfig: {
-          temperature: 0.2,
-          responseMimeType: "application/json",
-        },
+        generationConfig: genCfg,
       }),
     }
   );
@@ -925,6 +996,7 @@ async function reviewVideo(env, db, { videoUrl, r2Key, mimeType, meta }) {
   const model = await resolveModel(db, env);
   const displayName = (meta && (meta.title || meta.name)) || "ops-hub-video-review";
 
+  const fidelity = await resolveFidelity(db);
   const source = await resolveSource(env, { videoUrl, r2Key, mimeType });
   const uploaded = await uploadToGemini(apiKey, source, String(displayName).slice(0, 120));
   try {
@@ -932,7 +1004,9 @@ async function reviewVideo(env, db, { videoUrl, r2Key, mimeType, meta }) {
     const { review, usage } = await generateReview(apiKey, model, {
       uri: active.uri || uploaded.uri,
       mimeType: active.mimeType || uploaded.mimeType,
-    });
+    }, fidelity);
+    usage.fps = fidelity.fps;
+    usage.media_resolution = fidelity.resolution;
 
     // --- RAG grounding pass -------------------------------------------------
     // Pass 1 above judged claims from the model's own knowledge. This second,
@@ -962,6 +1036,7 @@ async function reviewVideo(env, db, { videoUrl, r2Key, mimeType, meta }) {
       review.grounding = { error: "grounding not configured", checked: 0 };
     }
 
+    applyVisualConcerns(review);
     return { review: enforceHumanNurse(review), usage };
   } finally {
     await deleteGeminiFile(apiKey, uploaded.name);
@@ -1022,6 +1097,27 @@ export async function handleVideoReviewAPI(request, env, path) {
       }
       await setConfig(db, "model", model);
       return new Response(JSON.stringify({ ok: true, selected: model }), { headers: cors });
+    }
+
+    // GET/POST /video-review/api/fidelity  { fps, resolution }
+    // How many frames the model sees and at what detail.
+    if (path === "/video-review/api/fidelity" && request.method === "GET") {
+      const f = await resolveFidelity(db);
+      return new Response(JSON.stringify({ ...f, allowed_fps: ALLOWED_FPS, allowed_resolution: ALLOWED_RESOLUTION }), { headers: cors });
+    }
+    if (path === "/video-review/api/fidelity" && request.method === "POST") {
+      const b = await request.json().catch(() => ({}));
+      const fps = parseFloat(b.fps);
+      if (!ALLOWED_FPS.includes(fps)) {
+        return new Response(JSON.stringify({ error: `fps must be one of ${ALLOWED_FPS.join(", ")}` }), { status: 400, headers: cors });
+      }
+      const resolution = String(b.resolution || "default");
+      if (!ALLOWED_RESOLUTION.includes(resolution)) {
+        return new Response(JSON.stringify({ error: `resolution must be one of ${ALLOWED_RESOLUTION.join(", ")}` }), { status: 400, headers: cors });
+      }
+      await setConfig(db, "video_fps", String(fps));
+      await setConfig(db, "media_resolution", resolution);
+      return new Response(JSON.stringify({ ok: true, fps, resolution }), { headers: cors });
     }
 
     // ---- chunked upload (drag-and-drop from the browser) ----------------
