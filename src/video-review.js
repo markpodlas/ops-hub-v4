@@ -78,6 +78,13 @@ async function ensureVideoReviewTables(db) {
     )`),
     db.prepare(`CREATE INDEX IF NOT EXISTS idx_video_reviews_created_at ON video_reviews (created_at DESC)`),
     db.prepare(`CREATE INDEX IF NOT EXISTS idx_video_reviews_needs_human ON video_reviews (needs_human_nurse)`),
+    // Model choice lives in D1, not just the wrangler var, so it can be changed
+    // from the UI without a deploy. Same shape as campaign_router_config.
+    db.prepare(`CREATE TABLE IF NOT EXISTS video_review_config (
+      key         TEXT PRIMARY KEY,
+      value       TEXT,
+      updated_at  TEXT
+    )`),
   ]);
 
   // Self-migration for tables created before r2_key existed (migration 0001 was
@@ -87,6 +94,96 @@ async function ensureVideoReviewTables(db) {
   try {
     await db.prepare(`ALTER TABLE video_reviews ADD COLUMN r2_key TEXT`).run();
   } catch { /* column already there */ }
+  // Which model produced a given report — needed to make sense of history once
+  // the model can be switched from the UI.
+  try {
+    await db.prepare(`ALTER TABLE video_reviews ADD COLUMN model TEXT`).run();
+  } catch { /* column already there */ }
+}
+
+// ----------------------------------------------------------------------------
+// Model selection.
+//
+// Resolution order: the model saved in D1 (set from the UI) -> env.GEMINI_MODEL
+// (wrangler var) -> DEFAULT_MODEL. Google retires Gemini models on a schedule
+// and, worse, stops serving them to new API keys BEFORE the published retirement
+// date — which is what broke gemini-2.5-flash here. Keeping the choice in D1
+// means recovering from that is a dropdown, not a deploy.
+// ----------------------------------------------------------------------------
+async function getConfig(db, key) {
+  try {
+    const row = await db.prepare(`SELECT value FROM video_review_config WHERE key = ?`).bind(key).first();
+    return row ? row.value : null;
+  } catch { return null; }
+}
+
+async function setConfig(db, key, value) {
+  await db.prepare(`INSERT INTO video_review_config (key, value, updated_at)
+    VALUES (?, ?, datetime('now'))
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')`)
+    .bind(key, value).run();
+}
+
+async function resolveModel(db, env) {
+  return (await getConfig(db, "model")) || env.GEMINI_MODEL || DEFAULT_MODEL;
+}
+
+// Ask Gemini what this API key can actually use, rather than hardcoding a list
+// that rots. Filtered to models that support generateContent and can take video.
+async function listGeminiModels(apiKey) {
+  const out = [];
+  let pageToken = "";
+  // Paginate, but bound it — the list is short and a runaway loop here would
+  // burn subrequests for nothing.
+  for (let page = 0; page < 5; page++) {
+    const url = `${GEMINI_BASE}/v1beta/models?key=${encodeURIComponent(apiKey)}&pageSize=200`
+      + (pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : "");
+    const res = await fetch(url);
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(`Gemini listModels -> ${res.status}: ${text.slice(0, 300)}`);
+    }
+    const data = await res.json();
+    for (const m of data.models || []) out.push(m);
+    pageToken = data.nextPageToken || "";
+    if (!pageToken) break;
+  }
+
+  return out
+    .filter((m) => (m.supportedGenerationMethods || []).includes("generateContent"))
+    // Drop embedding/vision-only and other non-chat families that can't do this job.
+    .filter((m) => /^models\/gemini/.test(m.name || ""))
+    .map((m) => ({
+      id: (m.name || "").replace(/^models\//, ""),
+      label: m.displayName || (m.name || "").replace(/^models\//, ""),
+      description: m.description || "",
+      input_token_limit: m.inputTokenLimit || null,
+    }))
+    .sort((a, b) => a.id.localeCompare(b.id));
+}
+
+// Cheap text-only call used to prove a model actually works with this key before
+// we save it. This is the check that would have caught the retired-model 404 at
+// selection time instead of halfway through a video review.
+async function verifyModel(apiKey, model) {
+  const res = await fetch(
+    `${GEMINI_BASE}/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [{ role: "user", parts: [{ text: "Reply with the single word: ok" }] }],
+        generationConfig: { temperature: 0, maxOutputTokens: 512 },
+      }),
+    }
+  );
+  if (!res.ok) {
+    const text = await res.text();
+    let msg = text.slice(0, 300);
+    try { msg = JSON.parse(text)?.error?.message || msg; } catch { /* keep raw */ }
+    throw new Error(msg);
+  }
+  return true;
 }
 
 // Keys come from the client on every upload/playback call, so never trust one:
@@ -449,9 +546,9 @@ async function generateReview(apiKey, model, file) {
 // ----------------------------------------------------------------------------
 // Full pipeline: fetch -> upload -> wait ACTIVE -> review -> enforce -> cleanup
 // ----------------------------------------------------------------------------
-async function reviewVideo(env, { videoUrl, r2Key, mimeType, meta }) {
+async function reviewVideo(env, db, { videoUrl, r2Key, mimeType, meta }) {
   const apiKey = env.GEMINI_API_KEY;
-  const model = env.GEMINI_MODEL || DEFAULT_MODEL;
+  const model = await resolveModel(db, env);
   const displayName = (meta && (meta.title || meta.name)) || "ops-hub-video-review";
 
   const source = await resolveSource(env, { videoUrl, r2Key, mimeType });
@@ -485,6 +582,45 @@ export async function handleVideoReviewAPI(request, env, path) {
   await ensureVideoReviewTables(db);
 
   try {
+    // ---- model selection ------------------------------------------------
+
+    // GET /video-review/api/models — what this API key can actually use, plus
+    // which one is currently selected and where that selection came from.
+    if (path === "/video-review/api/models" && request.method === "GET") {
+      if (!env.GEMINI_API_KEY) {
+        return new Response(JSON.stringify({ error: "GEMINI_API_KEY not configured" }), { status: 500, headers: cors });
+      }
+      const saved = await getConfig(db, "model");
+      const models = await listGeminiModels(env.GEMINI_API_KEY);
+      return new Response(JSON.stringify({
+        models,
+        selected: saved || env.GEMINI_MODEL || DEFAULT_MODEL,
+        source: saved ? "saved" : (env.GEMINI_MODEL ? "wrangler var" : "built-in default"),
+        env_default: env.GEMINI_MODEL || DEFAULT_MODEL,
+      }), { headers: cors });
+    }
+
+    // POST /video-review/api/models  { model }
+    // Verified against the live API before saving, so a retired or unavailable
+    // model is rejected here rather than failing mid-review.
+    if (path === "/video-review/api/models" && request.method === "POST") {
+      if (!env.GEMINI_API_KEY) {
+        return new Response(JSON.stringify({ error: "GEMINI_API_KEY not configured" }), { status: 500, headers: cors });
+      }
+      const b = await request.json().catch(() => ({}));
+      const model = typeof b.model === "string" ? b.model.trim() : "";
+      if (!model || !/^[\w.\-]+$/.test(model)) {
+        return new Response(JSON.stringify({ error: "a valid model id is required" }), { status: 400, headers: cors });
+      }
+      try {
+        await verifyModel(env.GEMINI_API_KEY, model);
+      } catch (e) {
+        return new Response(JSON.stringify({ error: `${model} did not work: ${e.message}` }), { status: 400, headers: cors });
+      }
+      await setConfig(db, "model", model);
+      return new Response(JSON.stringify({ ok: true, selected: model }), { headers: cors });
+    }
+
     // ---- chunked upload (drag-and-drop from the browser) ----------------
     // Multipart, not one big PUT: video length varies and a single request that
     // dies at 95% is a miserable way to find out you hit a size ceiling.
@@ -589,7 +725,7 @@ export async function handleVideoReviewAPI(request, env, path) {
         return new Response(JSON.stringify({ error: "GEMINI_API_KEY not configured" }), { status: 500, headers: cors });
       }
 
-      const { review, usage } = await reviewVideo(env, {
+      const { review, usage } = await reviewVideo(env, db, {
         videoUrl,
         r2Key,
         mimeType: body.mimeType,
@@ -601,8 +737,8 @@ export async function handleVideoReviewAPI(request, env, path) {
       // Source label: the URL for a link, the original filename for an upload.
       const sourceLabel = videoUrl || (body.meta && body.meta.filename) || r2Key;
       await db.prepare(`INSERT INTO video_reviews
-          (id, video_url, r2_key, video_meta, recommendation, needs_human_nurse, review_json, input_tokens, output_tokens, est_cost_usd)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+          (id, video_url, r2_key, video_meta, recommendation, needs_human_nurse, review_json, input_tokens, output_tokens, est_cost_usd, model)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
         .bind(
           id,
           sourceLabel,
@@ -613,7 +749,8 @@ export async function handleVideoReviewAPI(request, env, path) {
           JSON.stringify(review),
           usage.input_tokens,
           usage.output_tokens,
-          usage.est_cost_usd
+          usage.est_cost_usd,
+          usage.model
         ).run();
 
       return new Response(JSON.stringify({ id, needs_human_nurse: needsHumanNurse, review, usage }), { headers: cors });
@@ -621,7 +758,7 @@ export async function handleVideoReviewAPI(request, env, path) {
 
     // GET /video-review/api/reviews  — 50 most recent
     if (path === "/video-review/api/reviews" && request.method === "GET") {
-      const result = await db.prepare(`SELECT id, video_url, r2_key, recommendation, needs_human_nurse, est_cost_usd, created_at
+      const result = await db.prepare(`SELECT id, video_url, r2_key, recommendation, needs_human_nurse, est_cost_usd, model, created_at
         FROM video_reviews ORDER BY created_at DESC LIMIT 50`).all();
       return new Response(JSON.stringify({ reviews: result.results }), { headers: cors });
     }

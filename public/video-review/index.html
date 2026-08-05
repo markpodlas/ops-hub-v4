@@ -94,6 +94,18 @@
   tbody tr:hover { background: var(--surface); }
   .err { background: var(--red-bg); color: var(--red); border-radius: 10px; padding: 13px 15px; font-size: 13.5px; margin-top: 16px; line-height: 1.5; display: none; }
   .err.show { display: block; }
+
+  /* ---- model picker ---- */
+  .model-bar { margin-top: 22px; background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 14px 16px; }
+  .model-row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  .model-label { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .5px; color: var(--faint); }
+  select {
+    flex: 1; min-width: 220px; padding: 9px 11px; border-radius: 9px; border: 1px solid var(--border2);
+    background: var(--panel); color: var(--text); font-size: 13.5px; font-family: inherit;
+  }
+  .model-note { font-size: 12.5px; color: var(--muted); margin-top: 8px; line-height: 1.45; }
+  .model-note.ok { color: var(--green); }
+  .model-note.bad { color: var(--red); }
   @media (max-width: 600px) { .wrap { padding: 20px 14px; } h1 { font-size: 22px; } .hide-sm { display: none; } }
 </style>
 <script defer src="/shared/nav.js"></script>
@@ -124,14 +136,23 @@
 
   <div class="err" id="err"></div>
 
+  <div class="model-bar">
+    <div class="model-row">
+      <span class="model-label">Model</span>
+      <select id="model"><option>Loading…</option></select>
+      <button id="modelSave" disabled>Use this</button>
+    </div>
+    <div class="model-note" id="modelNote">Checking which models your API key can use…</div>
+  </div>
+
   <div class="report" id="report"></div>
 
   <div class="sec" style="margin-top:30px">
     <h2>Recent reviews <span id="histCount"></span></h2>
     <div class="sec-body" style="padding:0 6px 4px">
       <table>
-        <thead><tr><th>Video</th><th>Verdict</th><th>Nurse</th><th class="hide-sm">Cost</th><th class="hide-sm">When</th></tr></thead>
-        <tbody id="hist"><tr><td colspan="5" class="empty" style="padding-left:10px">Loading…</td></tr></tbody>
+        <thead><tr><th>Video</th><th>Verdict</th><th>Nurse</th><th class="hide-sm">Model</th><th class="hide-sm">Cost</th><th class="hide-sm">When</th></tr></thead>
+        <tbody id="hist"><tr><td colspan="6" class="empty" style="padding-left:10px">Loading…</td></tr></tbody>
       </table>
     </div>
   </div>
@@ -336,7 +357,7 @@ async function loadHistory() {
     const rows = data.reviews || [];
     $("histCount").textContent = rows.length ? rows.length : "";
     if (!rows.length) {
-      $("hist").innerHTML = '<tr><td colspan="5" class="empty" style="padding-left:10px">No reviews yet.</td></tr>';
+      $("hist").innerHTML = '<tr><td colspan="6" class="empty" style="padding-left:10px">No reviews yet.</td></tr>';
       return;
     }
     $("hist").innerHTML = rows.map((r) => {
@@ -346,6 +367,7 @@ async function loadHistory() {
         + '<td>' + esc(name.length > 42 ? name.slice(0, 42) + "…" : name) + '</td>'
         + '<td><span class="pill ' + cls + '">' + esc(text) + '</span></td>'
         + '<td>' + (r.needs_human_nurse ? '<span class="pill amber">yes</span>' : '<span class="pill green">no</span>') + '</td>'
+        + '<td class="hide-sm"><span class="ts">' + esc(r.model || "—") + '</span></td>'
         + '<td class="hide-sm">$' + Number(r.est_cost_usd || 0).toFixed(4) + '</td>'
         + '<td class="hide-sm">' + esc((r.created_at || "").replace("T", " ").slice(0, 16)) + '</td>'
         + '</tr>';
@@ -354,7 +376,7 @@ async function loadHistory() {
       tr.addEventListener("click", () => openReview(tr.getAttribute("data-id")));
     });
   } catch (e) {
-    $("hist").innerHTML = '<tr><td colspan="5" class="empty" style="padding-left:10px">Could not load: ' + esc(e.message) + '</td></tr>';
+    $("hist").innerHTML = '<tr><td colspan="6" class="empty" style="padding-left:10px">Could not load: ' + esc(e.message) + '</td></tr>';
   }
 }
 
@@ -366,6 +388,62 @@ async function openReview(id) {
   } catch (e) { showErr(e.message); }
 }
 
+// ---- model picker ----------------------------------------------------------
+// Options come from Gemini's own model list, not a hardcoded array — Google
+// retires models (and cuts them off for new keys ahead of the published date),
+// so any list baked into this page would eventually lie.
+async function loadModels() {
+  const sel = $("model"), note = $("modelNote"), save = $("modelSave");
+  try {
+    const data = await fetch(API + "/models").then(toJson);
+    if (!data.models.length) {
+      sel.innerHTML = '<option>No usable models found</option>';
+      note.textContent = "Gemini returned no models that support this kind of review.";
+      note.className = "model-note bad";
+      return;
+    }
+    sel.innerHTML = data.models.map((m) =>
+      '<option value="' + esc(m.id) + '"' + (m.id === data.selected ? " selected" : "") + '>'
+      + esc(m.label) + " — " + esc(m.id) + '</option>').join("");
+    // The saved model may itself be retired and absent from the list; surface
+    // that instead of silently showing whatever happens to be first.
+    if (!data.models.some((m) => m.id === data.selected)) {
+      sel.insertAdjacentHTML("afterbegin",
+        '<option value="" selected>' + esc(data.selected) + ' (not available — pick another)</option>');
+      note.textContent = data.selected + " is set but your API key can't use it. Choose one above and click Use this.";
+      note.className = "model-note bad";
+    } else {
+      note.textContent = "Currently using " + data.selected + " (" + data.source + ").";
+      note.className = "model-note";
+    }
+    save.disabled = false;
+  } catch (e) {
+    sel.innerHTML = '<option>Could not load</option>';
+    note.textContent = e.message;
+    note.className = "model-note bad";
+  }
+}
+
+async function saveModel() {
+  const sel = $("model"), note = $("modelNote"), save = $("modelSave");
+  const model = sel.value;
+  if (!model) { note.textContent = "Pick a model first."; note.className = "model-note bad"; return; }
+  save.disabled = true;
+  note.textContent = "Testing " + model + "…";
+  note.className = "model-note";
+  try {
+    await fetch(API + "/models", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model }),
+    }).then(toJson);
+    note.textContent = "✓ " + model + " works and is now in use.";
+    note.className = "model-note ok";
+  } catch (e) {
+    note.textContent = e.message;
+    note.className = "model-note bad";
+  } finally { save.disabled = false; }
+}
+
 // ---- wiring ----------------------------------------------------------------
 const drop = $("drop");
 drop.addEventListener("click", () => { if (!busy) $("file").click(); });
@@ -375,7 +453,9 @@ $("file").addEventListener("change", (e) => { if (e.target.files[0]) handleFile(
 drop.addEventListener("drop", (e) => { const f = e.dataTransfer.files[0]; if (f) handleFile(f); });
 $("urlgo").addEventListener("click", handleUrl);
 $("url").addEventListener("keydown", (e) => { if (e.key === "Enter") handleUrl(); });
+$("modelSave").addEventListener("click", saveModel);
 
+loadModels();
 loadHistory();
 </script>
 </body>
